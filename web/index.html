@@ -46,6 +46,24 @@
         <button id="addObs" class="btn btn-ghost" type="button">＋ 观测</button>
       </div>
 
+      <div class="block">
+        <div class="block-head">
+          <h3>单边失效复核</h3>
+          <span class="hint">默认关闭，不影响原请求与裁决</span>
+        </div>
+        <label class="check-field">
+          <input id="reviewEnabled" type="checkbox" />
+          <span>启用单边失效复核（结论不依赖任何一条勉强合格的观测）</span>
+        </label>
+        <div id="reviewThresholdWrap" class="review-threshold" hidden>
+          <label class="field">
+            <span>整数可信改正阈值（mm，非负整数）</span>
+            <input id="reviewThreshold" type="text" inputmode="numeric" value="1" />
+          </label>
+          <p class="hint">启用后，仅实际绝对改正量 ≤ 阈值的观测可作为复核边；服务端联合选择整数高程，使复核边连接全部测站，且移除其中任意一条后各站仍能沿复核边到达基准站，再按最大改正量、改正总和、高程序列裁决。</p>
+        </div>
+      </div>
+
       <div class="actions">
         <button id="submit" class="btn btn-primary" type="button">提交配平</button>
         <button id="reset" class="btn btn-ghost" type="button">恢复示例</button>
@@ -62,6 +80,7 @@
       <div id="emptyBanner" class="banner banner-muted">尚未提交。录入或核对草稿后点击「提交配平」。</div>
 
       <div id="result" hidden>
+        <div id="reviewBanner" class="banner banner-review" hidden></div>
         <div class="obj-line">
           <div><span class="obj-label">最大绝对改正量</span><strong id="objM"></strong><span class="unit">mm</span></div>
           <div><span class="obj-label">绝对改正量总和</span><strong id="objS"></strong><span class="unit">mm</span></div>
@@ -78,9 +97,17 @@
         <div class="block">
           <h3>逐观测改正与回算高差</h3>
           <table class="data">
-            <thead><tr><th>方向</th><th>实测 (mm)</th><th>改正 (mm)</th><th>回算高差 (mm)</th><th>允许 (mm)</th></tr></thead>
+            <thead><tr><th>方向</th><th>实测 (mm)</th><th>改正 (mm)</th><th>回算高差 (mm)</th><th>允许 (mm)</th><th id="reviewColHead" hidden>复核网</th></tr></thead>
             <tbody id="obsResult"></tbody>
           </table>
+        </div>
+
+        <div class="block" id="witnessBlock" hidden>
+          <div class="block-head">
+            <h3>两路基准见证（单边失效复核）</h3>
+            <span class="hint">每个非基准站两条无公共观测的基准路径；沿「实测+改正」可独立核对，任一复核边失效都不切断到达基准站的路线</span>
+          </div>
+          <div id="witnessResult"></div>
         </div>
 
         <div class="block">

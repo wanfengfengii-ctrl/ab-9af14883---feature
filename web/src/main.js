@@ -27,6 +27,8 @@ let draft = clone(EXAMPLE);
 let stale = false;        // 草稿在最近一次提交后被改过
 let renderedOnce = false; // 是否曾经展示过配平结果
 let submitting = false;
+let reviewEnabled = false;
+let reviewThreshold = '1';
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -200,6 +202,10 @@ function validateDraft() {
     if (!INT_RE.test(o.cap)) errors.push(`${tag}：最大允许改正量必须是整数（毫米）。`);
     else if (BigInt(o.cap) < 0n) errors.push(`${tag}：最大允许改正量不能为负。`);
   });
+  if (reviewEnabled) {
+    if (!INT_RE.test(reviewThreshold)) errors.push('可信改正阈值必须是整数（毫米）。');
+    else if (BigInt(reviewThreshold) < 0n) errors.push('可信改正阈值不能为负。');
+  }
   return errors;
 }
 
@@ -228,6 +234,9 @@ async function submit() {
       maxCorrection: o.cap,
     })),
   };
+  if (reviewEnabled) {
+    payload.review = { enabled: true, trustedCorrectionThreshold: reviewThreshold.trim() };
+  }
 
   try {
     const resp = await fetch('./api/leveling/adjust', {
@@ -242,15 +251,22 @@ async function submit() {
       return;
     }
     if (data.feasible === false) {
-      // 无可行配平：保留草稿、清除旧结果、明确指出允许改正量不足
+      // 无可行结论：保留草稿、清除旧结果。区分允许改正量不足与复核冗余不足
       renderedOnce = true;
       stale = false;
       $('#staleBanner').hidden = true;
       $('#result').hidden = true;
       $('#emptyBanner').hidden = true;
-      showError(data.message || '允许改正量不足，无法闭合。', [
-        '草稿已保留，可放宽若干观测的最大允许改正量后重新提交。',
-      ]);
+      if (data.reason === 'REVIEW_NOT_REDUNDANT') {
+        showError(data.message || '单边失效复核冗余不足。', [
+          '原网络可以配平，但在该可信改正阈值内，不存在连接全部测站且任一观测失效后仍可达基准站的复核网。',
+          '草稿已保留：可放大可信改正阈值、增加闭合环观测，或关闭单边失效复核后重新提交。',
+        ]);
+      } else {
+        showError(data.message || '允许改正量不足，无法闭合。', [
+          '草稿已保留，可放宽若干观测的最大允许改正量后重新提交。',
+        ]);
+      }
       return;
     }
     renderedOnce = true;
@@ -294,6 +310,9 @@ function renderResult(data, payload) {
   $('#objM').textContent = data.objective.maxAbsoluteCorrection;
   $('#objS').textContent = data.objective.sumAbsoluteCorrections;
 
+  const reviewOn = !!(data.review && data.review.enabled);
+  renderReviewBanner(data, reviewOn);
+
   // 各站高程
   const datum = b(payload.datumElevation);
   const stBody = $('#stationResult');
@@ -309,6 +328,8 @@ function renderResult(data, payload) {
   // 逐观测
   const obsBody = $('#obsResult');
   obsBody.innerHTML = '';
+  $('#reviewColHead').hidden = !reviewOn;
+  const T = reviewOn ? b(data.review.trustedCorrectionThreshold) : null;
   data.corrections.forEach((c) => {
     const tr = el('tr');
     const corr = b(c.correction);
@@ -319,11 +340,79 @@ function renderResult(data, payload) {
       el('td', '', c.recomputedDifference),
       el('td', '', `±${c.maxCorrection}`),
     );
+    if (reviewOn) {
+      // 复核网归属可由改正值与阈值独立核对
+      const inNet = (corr < 0n ? -corr : corr) <= T;
+      if (inNet !== !!c.inReviewNetwork) tr.classList.add('mismatch');
+      const tag = el('td', c.inReviewNetwork ? 'review-in' : 'review-out',
+        c.inReviewNetwork ? `复核边（|改正| ≤ ${T}）` : `不计入（|改正| > ${T}）`);
+      tr.append(tag);
+    }
     obsBody.append(tr);
   });
 
+  // 两路基准见证
+  if (reviewOn && data.review.redundant) renderWitnesses(data, payload);
+  else $('#witnessBlock').hidden = true;
+
   // 环路（由返回高程自然闭合）
   renderLoops(payload, data);
+}
+
+function renderReviewBanner(data, reviewOn) {
+  const banner = $('#reviewBanner');
+  if (!reviewOn) { banner.hidden = true; banner.innerHTML = ''; return; }
+  banner.innerHTML = '';
+  const rv = data.review;
+  const strong = el('strong', '', '单边失效复核已启用');
+  banner.append(strong);
+  if (rv.redundant) {
+    banner.append(document.createTextNode(
+      `：可信改正阈值 ${rv.trustedCorrectionThreshold} mm，${rv.reviewEdgeCount} 条观测进入复核网；`
+      + '复核网连接全部测站，移除其中任意一条后各站仍能沿复核边到达基准站。下方为每个非基准站的两路无公共观测见证。'));
+  }
+  banner.hidden = false;
+}
+
+function hopText(hop, payload) {
+  const o = payload.observations[hop.observationIndex];
+  return hop.from === o.from ? `${hop.from} → ${hop.to}` : `${hop.to} → ${hop.from}`;
+}
+
+function renderWitnesses(data, payload) {
+  const block = $('#witnessBlock');
+  const body = $('#witnessResult');
+  body.innerHTML = '';
+  block.hidden = false;
+  const corr = data.corrections;
+  const elev = new Map(data.stations.map((s) => [s.name, b(s.elevation)]));
+  const datum = elev.get(payload.stations[0]);
+
+  for (const w of data.review.witnessPaths) {
+    const card = el('div', 'witness-card');
+    card.append(el('div', 'witness-station', `测站 ${w.station}（高程差 ${elev.get(w.station) - datum} mm）`));
+    const pathList = el('div', 'witness-paths');
+    w.paths.forEach((path, pi) => {
+      const line = el('div', 'witness-path');
+      line.append(el('span', 'witness-tag', `见证 ${pi + 1}`));
+      const names = path.map((h) => hopText(h, payload)).join('　');
+      line.append(el('span', 'dir', names));
+      // 独立核对：沿路径 [实测+改正] 带符号求和
+      let sum = 0n;
+      let cur = payload.stations[0];
+      for (const h of path) {
+        const o = payload.observations[h.observationIndex];
+        const sign = o.from === cur ? 1n : -1n;
+        sum += sign * (b(o.measuredDifference) + b(corr[h.observationIndex].correction));
+        cur = sign === 1n ? o.to : o.from;
+      }
+      line.append(el('span', sum === elev.get(w.station) - datum ? 'witness-sum ok' : 'witness-sum bad',
+        `Σ(实测+改正) = ${sum}`));
+      pathList.append(line);
+    });
+    card.append(pathList);
+    body.append(card);
+  }
 }
 
 // ---------- 基础环（生成树弦环） ----------
@@ -411,8 +500,9 @@ function renderLoops(payload, data) {
     const names = cy.seq.map((i) => payload.stations[i]).join(' → ');
     for (const { ek, sign } of cy.signed) {
       const c = corr[ek];
-      measured += BigInt(sign) * b(payload.observations[ek].dh);
-      corrected += BigInt(sign) * (b(payload.observations[ek].dh) + b(c.correction));
+      const dh = b(payload.observations[ek].measuredDifference);
+      measured += BigInt(sign) * dh;
+      corrected += BigInt(sign) * (dh + b(c.correction));
     }
     const tr = el('tr');
     tr.append(
@@ -472,8 +562,25 @@ function bind() {
   $('#reset').addEventListener('click', () => {
     draft = clone(EXAMPLE);
     $('#datum').value = draft.datum;
+    reviewEnabled = false;
+    reviewThreshold = '1';
+    $('#reviewEnabled').checked = false;
+    $('#reviewThreshold').value = '1';
+    $('#reviewThresholdWrap').hidden = true;
     invalidate();
     renderAll();
+  });
+  $('#reviewEnabled').addEventListener('change', () => {
+    reviewEnabled = $('#reviewEnabled').checked;
+    $('#reviewThresholdWrap').hidden = !reviewEnabled;
+    invalidate();
+  });
+  $('#reviewThreshold').addEventListener('input', () => {
+    reviewThreshold = $('#reviewThreshold').value.trim();
+    const bad = reviewThreshold !== ''
+      && (!INT_RE.test(reviewThreshold) || BigInt(reviewThreshold) < 0n);
+    $('#reviewThreshold').classList.toggle('invalid', bad);
+    invalidate();
   });
 }
 

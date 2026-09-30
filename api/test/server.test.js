@@ -114,3 +114,93 @@ test('未知路由返回 404', async () => {
   const r = await fetch(`${base}/nope`);
   assert.equal(r.status, 404);
 });
+
+test('启用单边失效复核：标注复核边并返回两路见证', async () => {
+  const r = await fetch(`${base}/api/leveling/adjust`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stations: ['A', 'B', 'C', 'D', 'E'],
+      datumElevation: '1000',
+      observations: [
+        { from: 'A', to: 'B', measuredDifference: '12', maxCorrection: '5' },
+        { from: 'B', to: 'C', measuredDifference: '15', maxCorrection: '5' },
+        { from: 'C', to: 'D', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'D', to: 'A', measuredDifference: '-15', maxCorrection: '5' },
+        { from: 'A', to: 'E', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'E', to: 'D', measuredDifference: '25', maxCorrection: '5' },
+        { from: 'B', to: 'E', measuredDifference: '-20', maxCorrection: '5' },
+      ],
+      review: { enabled: true, trustedCorrectionThreshold: '1' },
+    }),
+  });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.feasible, true);
+  assert.equal(j.review.enabled, true);
+  assert.equal(j.review.trustedCorrectionThreshold, '1');
+  assert.equal(j.review.redundant, true);
+  assert.ok(j.corrections.every((c) => typeof c.inReviewNetwork === 'boolean'));
+  assert.equal(j.review.witnessPaths.length, 4);
+  for (const w of j.review.witnessPaths) {
+    assert.equal(w.paths.length, 2);
+    const a = new Set(w.paths[0].map((h) => h.observationIndex));
+    const bset = new Set(w.paths[1].map((h) => h.observationIndex));
+    for (const k of a) assert.equal(bset.has(k), false);
+  }
+});
+
+test('复核冗余不足：200 + REVIEW_NOT_REDUNDANT（保留草稿回显）', async () => {
+  const r = await fetch(`${base}/api/leveling/adjust`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stations: ['A', 'B', 'C', 'D', 'E'],
+      datumElevation: '1000',
+      observations: [
+        { from: 'A', to: 'B', measuredDifference: '10', maxCorrection: '5' },
+        { from: 'B', to: 'C', measuredDifference: '15', maxCorrection: '5' },
+        { from: 'C', to: 'D', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'D', to: 'A', measuredDifference: '-15', maxCorrection: '5' },
+        { from: 'B', to: 'D', measuredDifference: '5', maxCorrection: '5' },
+        { from: 'A', to: 'C', measuredDifference: '25', maxCorrection: '5' },
+        { from: 'A', to: 'E', measuredDifference: '-10', maxCorrection: '5' },
+      ],
+      review: { enabled: true, trustedCorrectionThreshold: '5' },
+    }),
+  });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.feasible, false);
+  assert.equal(j.reason, 'REVIEW_NOT_REDUNDANT');
+  assert.match(j.message, /复核冗余不足/);
+  assert.equal(j.review.redundant, false);
+  assert.equal(j.observations.length, 7);
+  assert.equal(j.stations[0].elevation, '1000');
+});
+
+test('复核配置非法：400 VALIDATION_FAILED 并定位字段', async () => {
+  const body = {
+    stations: ['A', 'B', 'C', 'D', 'E'],
+    datumElevation: '1000',
+    observations: [
+      { from: 'A', to: 'B', measuredDifference: '10', maxCorrection: '5' },
+      { from: 'B', to: 'C', measuredDifference: '15', maxCorrection: '5' },
+      { from: 'C', to: 'D', measuredDifference: '-10', maxCorrection: '5' },
+      { from: 'D', to: 'A', measuredDifference: '-15', maxCorrection: '5' },
+      { from: 'A', to: 'E', measuredDifference: '-10', maxCorrection: '5' },
+      { from: 'E', to: 'D', measuredDifference: '25', maxCorrection: '5' },
+      { from: 'B', to: 'E', measuredDifference: '-20', maxCorrection: '5' },
+    ],
+    review: { enabled: true, trustedCorrectionThreshold: '-2' },
+  };
+  const r = await fetch(`${base}/api/leveling/adjust`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  assert.equal(r.status, 400);
+  const j = await r.json();
+  assert.equal(j.error.code, 'VALIDATION_FAILED');
+  assert.ok(j.error.details.some((d) => d.field === 'review.trustedCorrectionThreshold'));
+});

@@ -120,8 +120,27 @@ input.invalid { border-color: var(--error); background: var(--error-bg); }
 .banner-warn { background: var(--warn-bg); color: var(--warn); border-color: #fcd34d; }
 .banner-error { background: var(--error-bg); color: var(--error); border-color: #fca5a5; white-space: pre-wrap; }
 .banner-muted { background: #f1f5f9; color: var(--muted); }
+.banner-review { background: #eef2ff; color: #3730a3; border-color: #c7d2fe; }
 .banner fieldset { border: 0; margin: 8px 0 0; padding: 0; }
 .banner ul { margin: 6px 0 0; padding-left: 18px; }
+
+.check-field { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; cursor: pointer; }
+.check-field input { margin-top: 2px; }
+.review-threshold { margin-top: 10px; padding: 10px 12px; background: #f8fafc; border: 1px dashed var(--line); border-radius: 8px; }
+.review-threshold .field { max-width: 320px; margin-bottom: 6px; }
+
+.data td.review-in { color: var(--ok); font-family: inherit; font-size: 12px; }
+.data td.review-out { color: var(--muted); font-family: inherit; font-size: 12px; }
+.data tr.mismatch td { background: var(--error-bg); }
+
+.witness-card { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; background: #fcfdff; }
+.witness-station { font-weight: 600; margin-bottom: 4px; }
+.witness-paths { display: flex; flex-direction: column; gap: 4px; }
+.witness-path { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
+.witness-tag { color: var(--primary); font-weight: 600; min-width: 52px; }
+.witness-sum { margin-left: auto; font-family: var(--mono); color: var(--muted); }
+.witness-sum.ok { color: var(--ok); }
+.witness-sum.bad { color: var(--error); font-weight: 700; }
 
 .obj-line { display: flex; gap: 18px; background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin-bottom: 6px; flex-wrap: wrap; }
 .obj-line > div { display: flex; align-items: baseline; gap: 6px; }

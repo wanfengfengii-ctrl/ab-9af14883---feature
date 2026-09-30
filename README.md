@@ -29,7 +29,7 @@ web/                 Vite + 原生 JS 前端
   Dockerfile         多阶段：node 构建 → nginx 运行
 verify/              一次性校验服务
   run.sh             等待健康 → 代码测试 → 前端构建 → API 冒烟，按失败数退出
-  smoke.mjs          闭合网冒烟（可行/不可行/校验失败/反代两条路径）
+  smoke.mjs          闭合网冒烟（可行/不可行/校验失败/复核启用与关闭/反代两条路径）
   Dockerfile
 docker-compose.yml   api / web / verify 三服务
 .env.example         WEB_PORT、API_PORT 配置样例
@@ -94,6 +94,18 @@ npm --prefix web run dev                     # 另一终端启动开发服务器
 约束：测站 5–10 个、名称唯一（第一个为基准站）；观测 7–18 条、方向完整；
 基准高程/实测高差/允许改正量均为整数毫米，允许改正量非负；水准网（忽略方向）须连通。
 
+**单边失效复核（可选，默认关闭）**：在请求中加
+
+```json
+"review": { "enabled": true, "trustedCorrectionThreshold": "1" }
+```
+
+`enabled` 必须为布尔值；启用时 `trustedCorrectionThreshold` 为非负整数毫米。
+服务端联合选择整数高程，使**实际绝对改正量 ≤ 阈值**的观测（复核边）连接全部测站，
+且移除其中任意一条复核边后每个测站仍能沿复核边到达基准站（复核网无桥）；
+再沿用「最小最大改正量 → 最小改正总和 → 高程序列字典序」三级裁决。
+未启用（缺省、`null` 或 `enabled:false`）时请求、裁决与响应与原来完全一致。
+
 成功（可行）：
 
 ```json
@@ -109,13 +121,48 @@ npm --prefix web run dev                     # 另一终端启动开发服务器
 }
 ```
 
+启用复核且通过时，每条观测额外返回布尔值 `inReviewNetwork`（恰好当
+`|correction| ≤ trustedCorrectionThreshold`，可由改正值独立核对），并附：
+
+```json
+{
+  "review": {
+    "enabled": true,
+    "trustedCorrectionThreshold": "1",
+    "redundant": true,
+    "reviewEdgeCount": 7,
+    "witnessPaths": [{
+      "station": "B", "stationIndex": 1,
+      "paths": [
+        [{ "observationIndex": 4, "from": "A", "to": "E" },
+         { "observationIndex": 6, "from": "B", "to": "E" }],
+        [{ "observationIndex": 0, "from": "A", "to": "B" }]
+      ]
+    }]
+  }
+}
+```
+
+每个非基准站两条**无公共观测**的基准路径（路径按行进方向书写，
+`observationIndex` 对应请求中的观测下标）；沿任一路径对「实测+改正」求带符号代数和
+都等于该站与基准站的高程差，任一复核边失效都不会切断到达基准站的路线。
+
 成功（但**允许改正量不足**，无可行配平）：HTTP 200，
 
 ```json
 { "feasible": false, "reason": "INSUFFICIENT_CORRECTION", "message": "允许改正量不足：…" }
 ```
 
-输入非法：HTTP 400，`error.code = VALIDATION_FAILED` 并附字段级 `details`；
+启用复核时，若**原网络可配平但不存在满足复核条件的整数高程**：HTTP 200，
+
+```json
+{ "feasible": false, "reason": "REVIEW_NOT_REDUNDANT", "message": "复核冗余不足：…",
+  "stations": [ /* 草稿回显 */ ], "observations": [ /* 草稿回显 */ ],
+  "review": { "enabled": true, "trustedCorrectionThreshold": "1", "redundant": false } }
+```
+
+输入非法：HTTP 400，`error.code = VALIDATION_FAILED` 并附字段级 `details`
+（复核配置错误定位到 `review.enabled` / `review.trustedCorrectionThreshold`）；
 请求体非 JSON：`INVALID_JSON`。
 
 ## 求解原理
@@ -129,13 +176,28 @@ npm --prefix web run dev                     # 另一终端启动开发服务器
    严格实现「先 S 后录入顺序字典序」。
 3. 节点-弧关联矩阵**全幺模**、右端为整数，LP 必有整数最优解；另设整数分支定界兜底。
 
-随机测试对数百个小型网络与全枚举暴力最优解逐字段对比（M、S、完整高程序列），
-另含往返平行观测、负基准、可行/不可行判定与 HTTP 层测试。
+启用单边失效复核时（阈值 T）：
+
+4. `cap_k ≤ T` 的观测恒为复核边；对 `cap_k > T` 的观测枚举「强制
+   `|c_k|≤T` / 保持 cap」组合。可行性用**增量 Floyd** 随 DFS 收紧/回溯
+   （一次松弛精确，按约束单调性剪枝）；拓扑上未连通时只枚举跨基准可达分量
+   的边、连通后只枚举跨越某条桥边割的边（Tarjan 判桥）。
+5. 二分满足「复核网连通且无桥」的最小全局 M，再在全部极小可行复核集上
+   复用第 2、3 步裁决取全局最优；复核边最终以**实际改正值**是否 ≤ T 确定。
+6. 两路见证由单位容量最小费用流（无向边拆点、基准→目标增广 2 单位）求得，
+   恰好得到两条边不相交的最短基准路径。
+
+随机测试对数百个小型网络与全枚举暴力最优解逐字段对比（M、S、完整高程序列、
+复核可行性与最终复核网），另含往返平行观测、负基准、可行/不可行/复核冗余不足
+判定与 HTTP 层测试。
 
 ## 前端行为
 
-- 任何草稿编辑（增删改测站/观测、改基准高程）都会**立即撤销旧结论**：
+- 任何草稿编辑（增删改测站/观测、改基准高程、切换复核开关或阈值）都会**立即撤销旧结论**：
   清空结果区并提示「草稿已修改，旧结论已撤销」，草稿内容完整保留。
 - 提交后由真实 API 渲染各站高程、逐观测改正值与回算高差。
 - 「环路闭合」表由返回高程沿生成树基础环自然计算：改正后的闭合代数和恒为 0。
 - 无可行配平时保留草稿、清除旧结果，并明确提示**允许改正量不足**。
+- 勾选「单边失效复核」并填写整数阈值后，请求附 `review` 配置；成功时逐观测标注
+  是否进入复核网（与阈值、改正值当场可核对），并为每个非基准站渲染两路无公共观测
+  见证及沿「实测+改正」的独立核算；**复核冗余不足**时保留草稿、清除旧结论并明确报告。

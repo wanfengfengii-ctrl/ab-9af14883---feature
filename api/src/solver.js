@@ -9,7 +9,19 @@
 //   2. S = Σ_k |c_k|
 //   3. (H[1], H[2], …, H[n-1]) 按录入顺序的字典序
 //
-// 算法：
+// 单边失效复核（review，默认关闭，请求中显式启用并给出整数阈值 T 才生效）：
+//   * 复核边 = 解中实际 |c_k| <= T 的观测（与返回改正值直接可核对）。
+//   * 复核边（忽略方向）必须连接全部测站，且移除其中任意一条后，每个测站
+//     仍能沿复核边到达基准站——即复核网相对基准站无桥边（2-边连通）。
+//   * cap_k <= T 的观测在任何可行解中必然 |c_k| <= T，是天然复核边；
+//     cap_k > T 的观测是否进入复核网取决于联合选出的高程。枚举后者
+//     「强制收紧到 T / 保持 cap」的组合，用 Floyd 判负环做可行性剪枝、
+//     Tarjan 判桥做拓扑剪枝，找到全部极小可行复核集后各自沿用三级裁决，
+//     取全局最优（不能先取原最优配平再回头检查桥边）。
+//   * 成功时另为每个非基准站返回两条无公共观测的基准路径（最小费用流，
+//     单位容量无向边拆点），供页面与外部由改正值独立核对。
+//
+// 算法（普通求解）：
 //   * 令 x_0=0、x_i=H[i]-datum（i>0），c_k = x_v-x_u-w_k。
 //     |c_k|<=b_k 是一组成对的差分约束，用 Floyd-Warshall 判负环做可行性判定，
 //     对 M 二分（b_k=min(M,cap_k)）得到最小 M*。
@@ -116,6 +128,25 @@ export function validateInput(input) {
     }
   });
 
+  // 单边失效复核配置（缺省/未启用时原请求语义完全不变）
+  let review = { enabled: false, threshold: null };
+  if (input.review !== undefined && input.review !== null) {
+    const rv = input.review;
+    if (typeof rv !== 'object' || Array.isArray(rv)) {
+      errors.push({ field: 'review', message: '单边失效复核配置必须是对象' });
+    } else if (typeof rv.enabled !== 'boolean') {
+      errors.push({ field: 'review.enabled', message: '必须是布尔值' });
+    } else if (rv.enabled) {
+      const threshold = toBigInt(
+        rv.trustedCorrectionThreshold,
+        'review.trustedCorrectionThreshold',
+        errors,
+        { nonNeg: true },
+      );
+      if (threshold !== null) review = { enabled: true, threshold };
+    }
+  }
+
   if (errors.length) throw new ValidationError('输入校验失败', errors);
 
   // 连通性（忽略方向）
@@ -139,7 +170,7 @@ export function validateInput(input) {
     );
   }
 
-  return { stations, datum: datum ?? 0n, observations };
+  return { stations, datum: datum ?? 0n, observations, review };
 }
 
 // ---- 精确分数 ------------------------------------------------------------
@@ -203,11 +234,11 @@ function floyd(n, edges) {
   return dist;
 }
 
-function diffDistances(n, problem, boundFor) {
+function diffDistancesBounds(n, observations, B) {
   const edges = [];
-  problem.observations.forEach((o, k) => {
+  observations.forEach((o, k) => {
     const w = shiftedObservation(o);
-    const b = boundFor(o, k);
+    const b = B[k];
     edges.push([o.fromIndex, o.toIndex, w + b]);
     edges.push([o.toIndex, o.fromIndex, b - w]);
   });
@@ -410,46 +441,18 @@ function lpSolveInteger(baseRows, costs) {
   return incumbent.values;
 }
 
-// ---- 主流程 --------------------------------------------------------------
+// ---- 给定每条边的上界 B_k，做 S + 字典序裁决，返回整数高程 --------------
 
-export function solveNetwork(input) {
-  const problem = validateInput(input);
+function optimizeElevations(problem, B) {
   const { stations, datum, observations } = problem;
   const n = stations.length;
   const m = observations.length;
   const nf = n - 1;
   const t0 = nf;
 
-  const maxCap = observations.reduce((a, o) => (o.maxCorrection > a ? o.maxCorrection : a), 0n);
-
-  // 阶段 1：硬界下总体可行？
-  const dist0 = diffDistances(n, problem, (o) => o.maxCorrection);
-  if (!distFeasible(dist0)) {
-    return {
-      feasible: false,
-      reason: 'INSUFFICIENT_CORRECTION',
-      message: '允许改正量不足：在各观测给定的最大允许改正量内，不存在能使全部环路闭合的整数高程解。请放宽若干观测的最大允许改正量，或核对实测高差。',
-      stations: stations.map((name, i) => ({ name, elevation: i === 0 ? datum.toString() : null })),
-      observations: observations.map((o) => ({
-        from: o.from, to: o.to,
-        measuredDifference: o.measuredDifference.toString(),
-        maxCorrection: o.maxCorrection.toString(),
-      })),
-    };
-  }
-
-  // 阶段 2：二分最小 M
-  let lo = 0n, hi = maxCap;
-  while (lo < hi) {
-    const mid = (lo + hi) / 2n;
-    const d = diffDistances(n, problem, (o) => (mid < o.maxCorrection ? mid : o.maxCorrection));
-    if (distFeasible(d)) hi = mid; else lo = mid + 1n;
-  }
-  const M = lo;
-  const B = observations.map((o) => (M < o.maxCorrection ? M : o.maxCorrection));
-
-  // 各 x_i 在 M* 下的紧可行整数区间
-  const dist = diffDistances(n, problem, (_o, k) => B[k]);
+  // 各 x_i 在 B 下的紧可行整数区间
+  const dist = diffDistancesBounds(n, observations, B);
+  if (!distFeasible(dist)) throw new Error('内部错误：在上界可行时调用裁决');
   const lows = [];
   const widths = [];
   for (let i = 1; i < n; i++) {
@@ -518,9 +521,37 @@ export function solveNetwork(input) {
   for (let i = 0; i < nf; i++) xs.push(lows[i] + values[i]);
   const elevations = xs.map((x) => datum + x);
 
-  const corrections = observations.map((o) => {
+  for (let k = 0; k < m; k++) {
+    const o = observations[k];
     const c = elevations[o.toIndex] - elevations[o.fromIndex] - o.measuredDifference;
-    return {
+    const ac = c < 0n ? -c : c;
+    if (ac > B[k]) throw new Error('内部错误：裁决解的改正量越过给定上界');
+  }
+  return { elevations, xs };
+}
+
+// ---- 结果拼装 ------------------------------------------------------------
+
+function stationEcho(stations, datum, elevations) {
+  return stations.map((name, i) => ({
+    name,
+    elevation: elevations ? elevations[i].toString() : (i === 0 ? datum.toString() : null),
+  }));
+}
+
+function observationEcho(o) {
+  return {
+    from: o.from,
+    to: o.to,
+    measuredDifference: o.measuredDifference.toString(),
+    maxCorrection: o.maxCorrection.toString(),
+  };
+}
+
+function buildCorrections(observations, elevations, inReview) {
+  return observations.map((o, k) => {
+    const c = elevations[o.toIndex] - elevations[o.fromIndex] - o.measuredDifference;
+    const item = {
       from: o.from,
       to: o.to,
       measuredDifference: o.measuredDifference.toString(),
@@ -528,29 +559,546 @@ export function solveNetwork(input) {
       correction: c.toString(),
       recomputedDifference: (o.measuredDifference + c).toString(),
     };
+    if (inReview) item.inReviewNetwork = inReview[k];
+    return item;
+  });
+}
+
+function objectiveOf(observations, elevations) {
+  let M = 0n, S = 0n;
+  for (const o of observations) {
+    const c = elevations[o.toIndex] - elevations[o.fromIndex] - o.measuredDifference;
+    const ac = c < 0n ? -c : c;
+    if (ac > M) M = ac;
+    S += ac;
+  }
+  return { M, S };
+}
+
+function insufficientCorrectionResult(problem, review) {
+  const { stations, datum, observations } = problem;
+  const result = {
+    feasible: false,
+    reason: 'INSUFFICIENT_CORRECTION',
+    message: '允许改正量不足：在各观测给定的最大允许改正量内，不存在能使全部环路闭合的整数高程解。请放宽若干观测的最大允许改正量，或核对实测高差。',
+    stations: stationEcho(stations, datum, null),
+    observations: observations.map(observationEcho),
+  };
+  if (review) result.review = review;
+  return result;
+}
+
+// ---- 复核网拓扑：连通性 + 桥边（Tarjan，支持平行边） ---------------------
+
+function graphRedundancy(n, observations, mask) {
+  const adj = Array.from({ length: n }, () => []);
+  observations.forEach((o, k) => {
+    if (!mask[k]) return;
+    adj[o.fromIndex].push([o.toIndex, k]);
+    adj[o.toIndex].push([o.fromIndex, k]);
+  });
+  const tin = new Array(n).fill(-1);
+  const low = new Array(n);
+  const bridges = new Set();
+  let timer = 0;
+  const dfs = (u, parentEdge) => {
+    tin[u] = low[u] = timer++;
+    for (const [v, k] of adj[u]) {
+      if (k === parentEdge) continue; // 仅排除具体父边；平行往返边算回边
+      if (tin[v] !== -1) {
+        if (tin[v] < low[u]) low[u] = tin[v];
+      } else {
+        dfs(v, k);
+        if (low[v] < low[u]) low[u] = low[v];
+        if (low[v] > tin[u]) bridges.add(k);
+      }
+    }
+  };
+  dfs(0, -1);
+  let connected = true;
+  for (let i = 0; i < n; i++) if (tin[i] === -1) connected = false;
+  return { connected, bridges };
+}
+
+// ---- 两条无公共观测的基准路径（单位容量最小费用流） ----------------------
+//
+// 每条无向观测边拆成 e_in -> e_out（容量 1、费用 1），端点各以容量 1 的
+// 零费弧接入：u -> e_in、v -> e_in、e_out -> u、e_out -> v。从基准站向
+// 目标站增广 2 个单位（Bellman-Ford 最短路），恰好得到两条边不相交的
+// 最短基准路径；增广不足 2 说明该站不满足单边失效冗余。
+
+function twoDatumPaths(n, observations, mask, root, target) {
+  const m = observations.length;
+  const N = n + 2 * m;
+  const ein = (k) => n + 2 * k;
+  const eout = (k) => n + 2 * k + 1;
+  const graph = Array.from({ length: N }, () => []);
+  const addArc = (u, v, cap, cost) => {
+    const a = { to: v, rev: graph[v].length, cap, cost };
+    const b = { to: u, rev: graph[u].length, cap: 0, cost: -cost };
+    graph[u].push(a);
+    graph[v].push(b);
+    return a;
+  };
+  const refs = observations.map((o, k) => {
+    if (!mask[k]) return null;
+    const through = addArc(ein(k), eout(k), 1, 1);
+    const fromU = addArc(o.fromIndex, ein(k), 1, 0);
+    const fromV = addArc(o.toIndex, ein(k), 1, 0);
+    const toU = addArc(eout(k), o.fromIndex, 1, 0);
+    const toV = addArc(eout(k), o.toIndex, 1, 0);
+    return { o, through, fromU, fromV, toU, toV };
   });
 
-  const gotM = corrections.reduce((a, x) => {
-    const v = BigInt(x.correction); const av = v < 0n ? -v : v;
-    return av > a ? av : a;
-  }, 0n);
-  const gotS = corrections.reduce((a, x) => {
-    const v = BigInt(x.correction);
-    return a + (v < 0n ? -v : v);
-  }, 0n);
+  const bellmanFord = () => {
+    const INF = 1n << 60n;
+    const dist = new Array(N).fill(INF);
+    const prev = new Array(N).fill(null);
+    dist[root] = 0n;
+    for (let pass = 0; pass < N - 1; pass++) {
+      let changed = false;
+      for (let u = 0; u < N; u++) {
+        if (dist[u] === INF) continue;
+        for (let ei = 0; ei < graph[u].length; ei++) {
+          const e = graph[u][ei];
+          if (e.cap <= 0) continue;
+          const nd = dist[u] + BigInt(e.cost);
+          if (nd < dist[e.to]) { dist[e.to] = nd; prev[e.to] = [u, ei]; changed = true; }
+        }
+      }
+      if (!changed) break;
+    }
+    return dist[target] === INF ? null : prev;
+  };
+
+  for (let unit = 0; unit < 2; unit++) {
+    const prev = bellmanFord();
+    if (!prev) return null;
+    for (let v = target; v !== root; v = prev[v][0]) {
+      const [u, ei] = prev[v];
+      const e = graph[u][ei];
+      e.cap -= 1;
+      graph[v][e.rev].cap += 1;
+    }
+  }
+
+  // 由流量恢复每条复核边的使用方向
+  const used = new Map(); // 观测下标 -> [起点, 终点]
+  refs.forEach((r, k) => {
+    if (!r || r.through.cap !== 0) return;
+    if (r.toV.cap === 0) used.set(k, [r.o.fromIndex, r.o.toIndex]);
+    else if (r.toU.cap === 0) used.set(k, [r.o.toIndex, r.o.fromIndex]);
+  });
+
+  // 拆成两条 root -> target 的路径（最短增广不会产生环）
+  const remaining = new Map();
+  for (const [k, [u, v]] of used) {
+    if (!remaining.has(u)) remaining.set(u, []);
+    remaining.get(u).push([v, k]);
+  }
+  const paths = [];
+  for (let p = 0; p < 2; p++) {
+    const hops = [];
+    let cur = root;
+    let guard = 0;
+    while (cur !== target) {
+      const outs = remaining.get(cur);
+      if (!outs || !outs.length) return null;
+      const [nxt, k] = outs.pop();
+      hops.push({
+        observationIndex: k,
+        from: observations[k].from,
+        to: observations[k].to,
+      });
+      cur = nxt;
+      if (++guard > n + m) return null;
+    }
+    paths.push(hops);
+  }
+  return paths;
+}
+
+function buildWitnesses(problem, mask) {
+  const { stations, observations } = problem;
+  const n = stations.length;
+  const witnessPaths = [];
+  for (let v = 1; v < n; v++) {
+    const paths = twoDatumPaths(n, observations, mask, 0, v);
+    if (!paths) throw new Error('内部错误：复核网无桥却找不到两条基准路径');
+    witnessPaths.push({ station: stations[v], stationIndex: v, paths });
+  }
+  return witnessPaths;
+}
+
+// ---- 普通求解（未启用复核） ----------------------------------------------
+
+function solvePlain(problem) {
+  const { stations, datum, observations } = problem;
+  const n = stations.length;
+  const caps = observations.map((o) => o.maxCorrection);
+  const maxCap = caps.reduce((a, c) => (c > a ? c : a), 0n);
+
+  // 阶段 1：硬界下总体可行？
+  if (!distFeasible(diffDistancesBounds(n, observations, caps))) {
+    return insufficientCorrectionResult(problem, null);
+  }
+
+  // 阶段 2：二分最小 M
+  let lo = 0n, hi = maxCap;
+  while (lo < hi) {
+    const mid = (lo + hi) / 2n;
+    const B = caps.map((c) => (mid < c ? mid : c));
+    if (distFeasible(diffDistancesBounds(n, observations, B))) hi = mid; else lo = mid + 1n;
+  }
+  const M = lo;
+  const B = caps.map((c) => (M < c ? M : c));
+
+  const { elevations } = optimizeElevations(problem, B);
+  const { M: gotM, S: gotS } = objectiveOf(observations, elevations);
   if (gotM !== M) throw new Error('内部错误：解未达到最优最大改正量');
-  for (const x of corrections) {
-    const v = BigInt(x.correction); const av = v < 0n ? -v : v;
-    if (av > BigInt(x.maxCorrection)) throw new Error('内部错误：改正量越限');
+  for (let k = 0; k < observations.length; k++) {
+    const o = observations[k];
+    const c = elevations[o.toIndex] - elevations[o.fromIndex] - o.measuredDifference;
+    const ac = c < 0n ? -c : c;
+    if (ac > o.maxCorrection) throw new Error('内部错误：改正量越限');
   }
 
   return {
     feasible: true,
-    stations: stations.map((name, i) => ({ name, elevation: elevations[i].toString() })),
-    corrections,
+    stations: stationEcho(stations, datum, elevations),
+    corrections: buildCorrections(observations, elevations, null),
     objective: {
       maxAbsoluteCorrection: M.toString(),
       sumAbsoluteCorrections: gotS.toString(),
     },
   };
+}
+
+// ---- 单边失效复核求解 -----------------------------------------------------
+
+function reviewNotRedundantResult(problem, T, message) {
+  const { stations, datum, observations } = problem;
+  return {
+    feasible: false,
+    reason: 'REVIEW_NOT_REDUNDANT',
+    message,
+    stations: stationEcho(stations, datum, null),
+    observations: observations.map(observationEcho),
+    review: {
+      enabled: true,
+      trustedCorrectionThreshold: T.toString(),
+      redundant: false,
+    },
+  };
+}
+
+function graphComponents(n, observations, mask) {
+  const adj = Array.from({ length: n }, () => []);
+  observations.forEach((o, k) => {
+    if (!mask[k]) return;
+    adj[o.fromIndex].push([o.toIndex, k]);
+    adj[o.toIndex].push([o.fromIndex, k]);
+  });
+  const comp = new Array(n).fill(-1);
+  const reach = [];
+  const stack = [0];
+  comp[0] = 0;
+  while (stack.length) {
+    const u = stack.pop();
+    reach.push(u);
+    for (const [v] of adj[u]) if (comp[v] === -1) { comp[v] = 0; stack.push(v); }
+  }
+  let cid = 1;
+  for (let s = 0; s < n; s++) {
+    if (comp[s] !== -1) continue;
+    comp[s] = cid;
+    stack.push(s);
+    while (stack.length) {
+      const u = stack.pop();
+      for (const [v] of adj[u]) if (comp[v] === -1) { comp[v] = cid; stack.push(v); }
+    }
+    cid++;
+  }
+  return { comp, reachSet: new Set(reach) };
+}
+
+// 差分约束最短路的增量维护：所有观测先取宽松上界，tighten(k) 把观测 k
+// 的成对弧改紧到 T，返回改动表供回溯恢复。
+//
+// 精确性：一次收紧同时降低同一条观测对应的一对反向弧 u→v、v→u。
+//   * 新负环：旧系统无负环，故新负环必含新弧。任何负闭合游走都含一个简单
+//     负环；简单环至多各用一次这两条弧，而同时含二者的简单环只能是 2 环。
+//     所以新负环等价于 w'(u→v)+d_old[v][u] < 0 或反向（2 环被两者包含），
+//     恰好由对角线更新 d'[u][u] / d'[v][v] 捕获。
+//   * 可行时的新最短路：无负环时最短距离由简单路径取得；简单路径不可能
+//     同时用这两条新弧（会重访 u、v），至多使用其中一次，形如
+//     d_old[i][u] + w' + d_old[v][j]（或反向），一次松弛即精确。
+// 多个约束沿 DFS 逐条收紧时，每一步父矩阵都是精确 APSP，归纳成立。
+function makeIncrementalFloyd(problem, relaxedBounds, tightT) {
+  const { observations } = problem;
+  const n = problem.stations.length;
+  const dist = diffDistancesBounds(n, observations, relaxedBounds);
+
+  const tighten = (k) => {
+    const o = observations[k];
+    const w = shiftedObservation(o);
+    const arcs = [[o.fromIndex, o.toIndex, w + tightT], [o.toIndex, o.fromIndex, tightT - w]];
+    const snapshot = dist.map((row) => row.slice());
+    const changes = new Map();
+    const setCell = (i, j, v) => {
+      const ck = i * n + j;
+      if (!changes.has(ck)) changes.set(ck, snapshot[i][j]);
+      dist[i][j] = v;
+    };
+    for (const [p, q, wt] of arcs) {
+      if (snapshot[p][q] !== null && wt >= snapshot[p][q]) continue;
+      for (let i = 0; i < n; i++) {
+        const dip = snapshot[i][p];
+        if (dip === null) continue;
+        for (let j = 0; j < n; j++) {
+          const dqj = snapshot[q][j];
+          if (dqj === null) continue;
+          const cand = dip + wt + dqj;
+          if (dist[i][j] === null || cand < dist[i][j]) setCell(i, j, cand);
+        }
+      }
+    }
+    return changes;
+  };
+  const undo = (changes) => {
+    for (const [ck, v] of changes) dist[Math.floor(ck / n)][ck % n] = v;
+  };
+  const feasible = () => {
+    for (let i = 0; i < n; i++) if (dist[i][i] < 0n) return false;
+    return true;
+  };
+  return { tighten, undo, feasible };
+}
+
+// 计算当前掩码对应的每条观测上界：收紧边取 min(T,cap)，其余取 min(M,cap)。
+function boundsForMask(caps, mk, M, T) {
+  return caps.map((c, k) => (mk[k] ? (T < c ? T : c) : (M < c ? M : c)));
+}
+
+// 枚举 cap_k > T 的观测「强制 |c_k|<=T（进入复核网）/ 保留 cap」的组合。
+// 只在 M > T 时使用：天然复核边（cap<=T）恒在网内。
+//   * 差分约束随「收紧」单调：当前不可行，加边只会更不可行 → 剪枝；
+//   * 拓扑剪枝：图未连通时，下一条强制边必须从基准可达分量跨到外部；
+//     已连通时选一条桥边 f，后续边必须跨越删 f 后的两侧割（否则 f 永远是桥）；
+//   * 当前复核网已连通且无桥边：得到一个极小可行复核集，交 visitor 后
+//     不再枚举其超集（放松约束的解空间更大，最优只会更好）。
+// visitor 返回 true 表示提前停止（存在性探测）。memo 以「掩码@M」为键：
+// 存在性探测可在二分 M 的多次调用间共享；需要访问全部极小集（最终裁决）
+// 时应传入独立 memo，避免被存在性阶段的剪枝跳过。
+function enumerateReviewSets(problem, T, M, visitor, memo = new Map()) {
+  const { observations } = problem;
+  const n = problem.stations.length;
+  const caps = observations.map((o) => o.maxCorrection);
+  const high = [];
+  observations.forEach((o, k) => { if (caps[k] > T) high.push(k); });
+
+  const mask = caps.map((c) => c <= T);
+  const relaxed = caps.map((c) => (M < c ? M : c));
+  const floyd = makeIncrementalFloyd(problem, relaxed, T);
+
+  // 求「下一条必须收紧」的候选边：未连通时跨基准可达分量；连通时跨某条
+  // 桥边删除后不含基准站一侧的割。两种情形都保证不遗漏任何可行复核超集。
+  const crossingCandidates = (topo) => {
+    if (!topo.connected) {
+      const { reachSet } = graphComponents(n, observations, mask);
+      return high.filter((k) => !mask[k]
+        && reachSet.has(observations[k].fromIndex) !== reachSet.has(observations[k].toIndex));
+    }
+    const f = topo.bridges.values().next().value;
+    const fu = observations[f].fromIndex;
+    const fv = observations[f].toIndex;
+    const adjNoF = Array.from({ length: n }, () => []);
+    observations.forEach((o, k2) => {
+      if (!mask[k2] || k2 === f) return;
+      adjNoF[o.fromIndex].push(o.toIndex);
+      adjNoF[o.toIndex].push(o.fromIndex);
+    });
+    const componentOf = (seed) => {
+      const seen = new Set([seed]);
+      const stk = [seed];
+      while (stk.length) {
+        const u = stk.pop();
+        for (const v of adjNoF[u]) if (!seen.has(v)) { seen.add(v); stk.push(v); }
+      }
+      return seen;
+    };
+    const side = componentOf(fv);
+    const far = side.has(0) ? componentOf(fu) : side;
+    return high.filter((k) => !mask[k]
+      && far.has(observations[k].fromIndex) !== far.has(observations[k].toIndex));
+  };
+
+  // 返回 { exists, stop }：exists=该掩码子树内是否存在可行复核集；
+  // stop=visitor 要求提前停止（祖先不再遍历兄弟分支）。
+  const dfs = () => {
+    let key = 0;
+    for (let i = 0; i < mask.length; i++) if (mask[i]) key |= 1 << i;
+    const cacheKey = `${key}@${M}`;
+    const cached = memo.get(cacheKey);
+    if (cached !== undefined) return { exists: cached, stop: false };
+
+    if (!floyd.feasible()) { memo.set(cacheKey, false); return { exists: false, stop: false }; }
+
+    const topo = graphRedundancy(n, observations, mask);
+    if (topo.connected && topo.bridges.size === 0) {
+      const stop = visitor(boundsForMask(caps, mask, M, T), mask.slice());
+      memo.set(cacheKey, true);
+      return { exists: true, stop: !!stop };
+    }
+
+    const crossing = crossingCandidates(topo);
+    let exists = false;
+    for (const k of crossing) {
+      const changes = floyd.tighten(k);
+      mask[k] = true;
+      const r = dfs();
+      mask[k] = false;
+      floyd.undo(changes);
+      if (r.exists) exists = true;
+      if (r.stop) return { exists: true, stop: true }; // 注意：不写当前掩码缓存
+    }
+    memo.set(cacheKey, exists);
+    return { exists, stop: false };
+  };
+
+  dfs();
+}
+
+function solveReview(problem) {
+  const { stations, datum, observations, review } = problem;
+  const n = stations.length;
+  const T = review.threshold;
+  const caps = observations.map((o) => o.maxCorrection);
+  const maxCap = caps.reduce((a, c) => (c > a ? c : a), 0n);
+  const reviewEcho = {
+    enabled: true,
+    trustedCorrectionThreshold: T.toString(),
+  };
+
+  // 0. 原网络本身可配平？（硬界可行性）
+  if (!distFeasible(diffDistancesBounds(n, observations, caps))) {
+    return insufficientCorrectionResult(problem, reviewEcho);
+  }
+
+  // 1. 普通最优 M0（不设复核条件）。M0 <= T 时存在「全部观测 |c|<=T」的
+  //    解：直接采用普通裁决解，复核网即整网——只需整网无桥边。
+  let lo0 = 0n, hi0 = maxCap;
+  while (lo0 < hi0) {
+    const mid = (lo0 + hi0) / 2n;
+    const B = caps.map((c) => (mid < c ? mid : c));
+    if (distFeasible(diffDistancesBounds(n, observations, B))) hi0 = mid; else lo0 = mid + 1n;
+  }
+  const M0 = lo0;
+
+  const fullMask = new Array(observations.length).fill(true);
+
+  if (M0 <= T) {
+    const topo = graphRedundancy(n, observations, fullMask);
+    if (!topo.connected || topo.bridges.size > 0) {
+      const names = topo.bridges.size
+        ? [...topo.bridges].map((k) => `${observations[k].from}→${observations[k].to}`).join('、')
+        : '';
+      return reviewNotRedundantResult(
+        problem, T,
+        `复核冗余不足：即使阈值 ${T} mm 内可以包含全部观测的改正量，水准网仍存在桥边观测（${names}）。`
+        + '该观测一旦失效，必有测站无法沿复核边到达基准站；请增加观测路线形成闭合环。',
+      );
+    }
+    const B = caps.map((c) => (M0 < c ? M0 : c));
+    return finalizeReview(problem, T, M0, optimizeElevations(problem, B), fullMask);
+  }
+
+  // 2. M0 > T：先看结构上限——即使所有高 cap 边都收 tight，是否存在
+  //    连通且无桥的复核网。
+  // 3. 二分满足复核条件的全局最小 M（Floyd 结果在多次枚举间缓存复用）。
+  const feasCache = new Map();
+  const existsAt = (M) => {
+    let found = false;
+    enumerateReviewSets(problem, T, M, () => { found = true; return true; }, feasCache);
+    return found;
+  };
+  if (!existsAt(maxCap)) {
+    return reviewNotRedundantResult(
+      problem, T,
+      `复核冗余不足：原网络可以配平，但不存在能使「改正量不超过 ${T} mm」的观测连通全部测站、`
+      + '且移除其中任意一条后各测站仍能沿这些观测到达基准站的整数高程。'
+      + '请适当放大可信改正阈值、增加闭合环观测，或核对被依赖的勉强合格观测。',
+    );
+  }
+  let lo = M0, hi = maxCap;
+  while (lo < hi) {
+    const mid = (lo + hi) / 2n;
+    if (existsAt(mid)) hi = mid; else lo = mid + 1n;
+  }
+  const M = lo;
+
+  // 4. 在所有极小可行复核集上沿用 S、高程序列裁决，取全局字典序最优。
+  //    用全新 memo：存在性阶段的缓存只表示「该子树有解」，直接复用会跳过
+  //    visitor；最终阶段必须真正访问每一个极小复核集。
+  let best = null;
+  enumerateReviewSets(problem, T, M, (B) => {
+    const cand = optimizeElevations(problem, B);
+    if (!best) { best = cand; return; }
+    const { S } = objectiveOf(observations, cand.elevations);
+    const { S: bS } = objectiveOf(observations, best.elevations);
+    if (S < bS || (S === bS && lexLess(cand.xs, best.xs))) best = cand;
+  }, new Map());
+  if (!best) throw new Error('内部错误：复核枚举前后不一致');
+
+  // 5. 复核边以「实际改正值」为准（被收紧边之外可能还有边恰好满足阈值）。
+  const actualMask = observations.map((o, k) => {
+    const c = best.elevations[o.toIndex] - best.elevations[o.fromIndex] - o.measuredDifference;
+    const ac = c < 0n ? -c : c;
+    return ac <= T;
+  });
+  const topo = graphRedundancy(n, observations, actualMask);
+  if (!topo.connected || topo.bridges.size > 0) {
+    throw new Error('内部错误：按实际改正值确定的复核网存在桥边');
+  }
+  return finalizeReview(problem, T, M, best, actualMask);
+}
+
+function lexLess(a, b) {
+  for (let i = 1; i < a.length; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
+function finalizeReview(problem, T, M, opt, mask) {
+  const { stations, datum, observations } = problem;
+  const { elevations } = opt;
+  const { M: gotM, S: gotS } = objectiveOf(observations, elevations);
+  if (gotM !== M) throw new Error('内部错误：复核解未达到最优最大改正量');
+  const reviewEdgeCount = mask.filter(Boolean).length;
+  return {
+    feasible: true,
+    stations: stationEcho(stations, datum, elevations),
+    corrections: buildCorrections(observations, elevations, mask),
+    objective: {
+      maxAbsoluteCorrection: M.toString(),
+      sumAbsoluteCorrections: gotS.toString(),
+    },
+    review: {
+      enabled: true,
+      trustedCorrectionThreshold: T.toString(),
+      redundant: true,
+      reviewEdgeCount,
+      witnessPaths: buildWitnesses(problem, mask),
+    },
+  };
+}
+
+// ---- 主流程 --------------------------------------------------------------
+
+export function solveNetwork(input) {
+  const problem = validateInput(input);
+  if (problem.review.enabled) return solveReview(problem);
+  return solvePlain(problem);
 }

@@ -368,3 +368,310 @@ test('负基准高程与负高差也能正确处理', () => {
   const r = solveNetwork(input);
   assertWellFormed(input, r);
 });
+
+// ---- 单边失效复核 --------------------------------------------------------
+
+const ZERO_ERROR_NET = () => makeInput({
+  stations: ['A', 'B', 'C', 'D', 'E'],
+  datum: 1000,
+  obs: [
+    ['A', 'B', 10, 5],
+    ['B', 'C', 15, 5],
+    ['C', 'D', -10, 5],
+    ['D', 'A', -15, 5],
+    ['A', 'E', -10, 5],
+    ['E', 'D', 25, 5],
+    ['B', 'E', -20, 5],
+  ],
+});
+
+// 校验返回的两路见证：两条路径边不相交、端点连续、全部使用复核边、
+// 沿「实测+改正」的带符号代数和等于该站与基准站的高程差。
+function assertWitnessPaths(input, r) {
+  const elev = new Map(r.stations.map((s) => [s.name, BigInt(s.elevation)]));
+  assert.ok(Array.isArray(r.review.witnessPaths));
+  assert.equal(r.review.witnessPaths.length, input.stations.length - 1);
+  for (const w of r.review.witnessPaths) {
+    assert.equal(w.station, input.stations[w.stationIndex]);
+    assert.equal(w.paths.length, 2);
+    const usedSets = w.paths.map((p) => new Set(p.map((h) => h.observationIndex)));
+    for (const s of usedSets) assert.equal(s.size, w.paths[usedSets.indexOf(s)].length, '路径内观测不重复');
+    for (const k of usedSets[0]) assert.ok(!usedSets[1].has(k), `到 ${w.station} 的两路见证共用观测 ${k}`);
+    const sums = w.paths.map((path) => {
+      let cur = input.stations[0];
+      let sum = 0n;
+      for (const h of path) {
+        const c = r.corrections[h.observationIndex];
+        const fwd = c.from === cur;
+        const rev = c.to === cur;
+        assert.ok(fwd || rev, '见证路径端点不连续');
+        const sign = fwd ? 1n : -1n;
+        sum += sign * (BigInt(c.measuredDifference) + BigInt(c.correction));
+        cur = fwd ? c.to : c.from;
+        assert.equal(c.inReviewNetwork, true, '见证路径只能使用复核边');
+      }
+      assert.equal(cur, w.station, '见证路径终点正确');
+      return sum;
+    });
+    const want = elev.get(w.station) - elev.get(input.stations[0]);
+    assert.equal(sums[0], want, '第一路见证可由改正值核对到目标高程');
+    assert.equal(sums[1], want, '第二路见证可由改正值核对到目标高程');
+  }
+}
+
+// 复核网结构断言：跨接基准连通，且删除任一复核边后仍连通。
+function assertReviewRedundancy(input, r) {
+  const n = input.stations.length;
+  const idx = new Map(input.stations.map((s, i) => [s, i]));
+  const edges = r.corrections
+    .map((c, k) => ({ k, u: idx.get(c.from), v: idx.get(c.to), in: c.inReviewNetwork }))
+    .filter((e) => e.in);
+  assert.ok(edges.length >= n, '无桥连通图复核边数不少于测站数');
+  for (const dead of edges.map((e) => e.k)) {
+    const adj = Array.from({ length: n }, () => []);
+    for (const e of edges) if (e.k !== dead) adj[e.u].push(e.v), adj[e.v].push(e.u);
+    const seen = new Array(n).fill(false);
+    const stk = [0];
+    seen[0] = true;
+    while (stk.length) {
+      const u = stk.pop();
+      for (const v of adj[u]) if (!seen[v]) { seen[v] = true; stk.push(v); }
+    }
+    assert.ok(seen.every(Boolean), `复核边 ${dead} 失效后仍须全部测站可达基准站`);
+  }
+}
+
+test('复核未启用：响应形态与旧接口完全一致（无 review、无 inReviewNetwork）', () => {
+  const r = solveNetwork(ZERO_ERROR_NET());
+  assert.equal(r.feasible, true);
+  assert.equal('review' in r, false);
+  for (const c of r.corrections) assert.equal('inReviewNetwork' in c, false);
+});
+
+test('review.enabled=false：即使带了配置字段也与原请求完全一致', () => {
+  const input = ZERO_ERROR_NET();
+  const a = solveNetwork(input);
+  const b = solveNetwork({ ...input, review: { enabled: false, trustedCorrectionThreshold: '9' } });
+  assert.deepEqual(b, a);
+});
+
+test('复核启用且整网满足阈值：标注全部观测并返回两路见证', () => {
+  const input = makeInput({
+    stations: ['A', 'B', 'C', 'D', 'E'],
+    datum: 1000,
+    obs: [
+      ['A', 'B', 12, 5],
+      ['B', 'C', 15, 5],
+      ['C', 'D', -10, 5],
+      ['D', 'A', -15, 5],
+      ['A', 'E', -10, 5],
+      ['E', 'D', 25, 5],
+      ['B', 'E', -20, 5],
+    ],
+  });
+  const r = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: '1' } });
+  const { M, S } = assertWellFormed(input, r);
+  assert.equal(M, 1n);
+  assert.equal(S, 3n);
+  assert.equal(r.review.enabled, true);
+  assert.equal(r.review.trustedCorrectionThreshold, '1');
+  assert.equal(r.review.redundant, true);
+  assert.equal(r.review.reviewEdgeCount, 7);
+  for (const c of r.corrections) {
+    const ac = BigInt(c.correction) < 0n ? -BigInt(c.correction) : BigInt(c.correction);
+    assert.equal(c.inReviewNetwork, ac <= 1n, '是否进入复核网可由改正值与阈值独立核对');
+    assert.equal(c.inReviewNetwork, true);
+  }
+  assertWitnessPaths(input, r);
+  assertReviewRedundancy(input, r);
+});
+
+test('复核可能抬高最大改正量：M0=2 时阈值 1 需要 M=3，且非复核边严格超阈值', () => {
+  // 该网普通最优 M0=2；阈值 1 下只有舍弃 AE、EA 等大改正边之外的联合高程
+  // 才能形成无桥复核网，代价是最大改正量升到 3。
+  const input = {
+    stations: ['A', 'B', 'C', 'D', 'E'],
+    datumElevation: '1000',
+    observations: [
+      { from: 'A', to: 'E', measuredDifference: '-3', maxCorrection: '3' },
+      { from: 'E', to: 'B', measuredDifference: '1', maxCorrection: '1' },
+      { from: 'A', to: 'D', measuredDifference: '-1', maxCorrection: '1' },
+      { from: 'D', to: 'C', measuredDifference: '3', maxCorrection: '3' },
+      { from: 'E', to: 'A', measuredDifference: '-1', maxCorrection: '3' },
+      { from: 'B', to: 'C', measuredDifference: '3', maxCorrection: '3' },
+      { from: 'D', to: 'E', measuredDifference: '1', maxCorrection: '2' },
+    ],
+  };
+  const plain = solveNetwork(input);
+  assert.equal(plain.objective.maxAbsoluteCorrection, '2');
+
+  const r = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: '1' } });
+  assert.equal(r.feasible, true);
+  assert.equal(r.objective.maxAbsoluteCorrection, '3', '复核条件可要求更大的最大改正量');
+  for (const c of r.corrections) {
+    const ac = BigInt(c.correction) < 0n ? -BigInt(c.correction) : BigInt(c.correction);
+    assert.equal(c.inReviewNetwork, ac <= 1n);
+  }
+  const reviewEdges = r.corrections.filter((c) => c.inReviewNetwork);
+  assert.ok(reviewEdges.length < r.corrections.length, '存在被排除出复核网的观测');
+  assertReviewRedundancy(input, r);
+  assertWitnessPaths(input, r);
+
+  // 阈值放宽到 2：恢复 M0=2 的高程，全部观测入网
+  const r2 = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: '2' } });
+  assert.equal(r2.feasible, true);
+  assert.equal(r2.objective.maxAbsoluteCorrection, '2');
+  assert.equal(r2.review.reviewEdgeCount, 7);
+  assertReviewRedundancy(input, r2);
+});
+
+test('结构性桥边：阈值再大也报复核冗余不足，并保留草稿与基准高程', () => {
+  // A-B-C-D 有闭合环和两条弦，E 只经单条 A-E 连接：A-E 是桥。
+  const input = makeInput({
+    stations: ['A', 'B', 'C', 'D', 'E'],
+    datum: 1000,
+    obs: [
+      ['A', 'B', 10, 5],
+      ['B', 'C', 15, 5],
+      ['C', 'D', -10, 5],
+      ['D', 'A', -15, 5],
+      ['B', 'D', 5, 5],
+      ['A', 'C', 25, 5],
+      ['A', 'E', -10, 5],
+    ],
+  });
+  assert.equal(solveNetwork(input).feasible, true);
+  const r = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: '5' } });
+  assert.equal(r.feasible, false);
+  assert.equal(r.reason, 'REVIEW_NOT_REDUNDANT');
+  assert.match(r.message, /复核冗余不足/);
+  assert.match(r.message, /A→E/);
+  assert.equal(r.stations[0].elevation, '1000');
+  assert.equal(r.stations[1].elevation, null);
+  assert.equal(r.observations.length, 7);
+  assert.equal(r.review.redundant, false);
+  assert.equal(r.review.trustedCorrectionThreshold, '5');
+});
+
+test('原网可配平但阈值内不存在无桥复核网：REVIEW_NOT_REDUNDANT', () => {
+  const input = {
+    stations: ['A', 'B', 'C', 'D', 'E'],
+    datumElevation: '1000',
+    observations: [
+      { from: 'A', to: 'C', measuredDifference: '-2', maxCorrection: '3' },
+      { from: 'A', to: 'D', measuredDifference: '2', maxCorrection: '1' },
+      { from: 'A', to: 'E', measuredDifference: '-1', maxCorrection: '3' },
+      { from: 'D', to: 'B', measuredDifference: '-1', maxCorrection: '3' },
+      { from: 'E', to: 'A', measuredDifference: '-2', maxCorrection: '2' },
+      { from: 'C', to: 'A', measuredDifference: '-2', maxCorrection: '1' },
+      { from: 'B', to: 'A', measuredDifference: '-1', maxCorrection: '2' },
+    ],
+  };
+  assert.equal(solveNetwork(input).feasible, true);
+  for (const T of ['0', '1']) {
+    const r = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: T } });
+    assert.equal(r.feasible, false, `T=${T}`);
+    assert.equal(r.reason, 'REVIEW_NOT_REDUNDANT', `T=${T}`);
+  }
+  // 放宽到 3：全部改正量都可纳入，整网无桥
+  const r3 = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: '3' } });
+  assert.equal(r3.feasible, true);
+  assert.equal(r3.review.reviewEdgeCount, 7);
+  assertReviewRedundancy(input, r3);
+});
+
+test('原网络本身不可配平时，复核请求仍返回 INSUFFICIENT_CORRECTION 并回带 review 配置', () => {
+  const input = makeInput({
+    stations: ['A', 'B', 'C', 'D', 'E'],
+    datum: 1000,
+    obs: [
+      ['A', 'B', 18, 1],
+      ['B', 'C', 15, 1],
+      ['C', 'D', -10, 1],
+      ['D', 'A', -13, 1],
+      ['A', 'E', -10, 1],
+      ['E', 'D', 25, 1],
+      ['B', 'E', -20, 1],
+    ],
+  });
+  const r = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: '1' } });
+  assert.equal(r.feasible, false);
+  assert.equal(r.reason, 'INSUFFICIENT_CORRECTION');
+  assert.deepEqual(r.review, { enabled: true, trustedCorrectionThreshold: '1' });
+});
+
+test('复核配置校验：enabled 必须为布尔值，阈值必须为非负整数', () => {
+  const base = ZERO_ERROR_NET();
+  assert.throws(() => validateInput({ ...base, review: { enabled: true } }), ValidationError);
+  assert.throws(() => validateInput({ ...base, review: { enabled: true, trustedCorrectionThreshold: '-1' } }), ValidationError);
+  assert.throws(() => validateInput({ ...base, review: { enabled: true, trustedCorrectionThreshold: '1.0' } }), ValidationError);
+  assert.throws(() => validateInput({ ...base, review: { enabled: 'yes', trustedCorrectionThreshold: '1' } }), ValidationError);
+  assert.throws(() => validateInput({ ...base, review: [] }), ValidationError);
+  // enabled=false 时不校验阈值
+  assert.doesNotThrow(() => validateInput({ ...base, review: { enabled: false, trustedCorrectionThreshold: 'x' } }));
+  // 安全整数的数字类型阈值也接受
+  assert.doesNotThrow(() => validateInput({ ...base, review: { enabled: true, trustedCorrectionThreshold: 2 } }));
+});
+
+test('复核随机性质：可行则阈值自洽、无桥冗余、两路见证；不可行则原网可配平', () => {
+  const rand = mulberry32(98765);
+  const stations = ['A', 'B', 'C', 'D', 'E'];
+  const n = 5;
+  const ri = (k) => BigInt(Math.floor(rand() * (2 * k + 1)) - k);
+  let redundant = 0;
+  let notRedundant = 0;
+  let infeasible = 0;
+  for (let trial = 0; trial < 60; trial++) {
+    const truth = [0n];
+    for (let i = 1; i < n; i++) truth.push(ri(3));
+    const edges = new Set();
+    const pairs = [];
+    const addEdge = (u, v) => {
+      const key = u * n + v;
+      if (u === v || edges.has(key)) return false;
+      edges.add(key);
+      pairs.push([u, v]);
+      return true;
+    };
+    const connected = [0];
+    while (connected.length < n) {
+      const u = connected[Math.floor(rand() * connected.length)];
+      const v = Math.floor(rand() * n);
+      if (!connected.includes(v)) { addEdge(u, v); connected.push(v); }
+    }
+    let guard = 0;
+    while (pairs.length < 7 && guard++ < 200) addEdge(Math.floor(rand() * n), Math.floor(rand() * n));
+    const T = BigInt(Math.floor(rand() * 2));
+    const obs = pairs.map(([u, v]) => {
+      const noise = ri(2);
+      const cap = 1n + BigInt(Math.floor(rand() * 3));
+      return [stations[u], stations[v], truth[v] - truth[u] + noise, cap];
+    });
+    const input = makeInput({ stations, datum: 1000, obs });
+    const r = solveNetwork({ ...input, review: { enabled: true, trustedCorrectionThreshold: String(T) } });
+    const plain = solveNetwork(input);
+    if (!plain.feasible) {
+      assert.equal(r.reason, 'INSUFFICIENT_CORRECTION');
+      infeasible++;
+      continue;
+    }
+    if (!r.feasible) {
+      assert.equal(r.reason, 'REVIEW_NOT_REDUNDANT');
+      assert.equal(r.review.redundant, false);
+      notRedundant++;
+      continue;
+    }
+    redundant++;
+    assert.equal(r.review.redundant, true);
+    assertWellFormed(input, r);
+    for (const c of r.corrections) {
+      const ac = BigInt(c.correction) < 0n ? -BigInt(c.correction) : BigInt(c.correction);
+      assert.equal(c.inReviewNetwork, ac <= T);
+    }
+    assert.ok(BigInt(r.objective.maxAbsoluteCorrection) >= BigInt(plain.objective.maxAbsoluteCorrection));
+    assertReviewRedundancy(input, r);
+    assertWitnessPaths(input, r);
+  }
+  assert.ok(redundant >= 5, `应有足够多的冗余成功样本：${redundant}`);
+  assert.ok(notRedundant >= 5, `应有足够多的复核冗余不足样本：${notRedundant}`);
+});
