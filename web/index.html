@@ -25,6 +25,23 @@
         <button id="addStation" class="btn btn-ghost" type="button">＋ 测站</button>
       </div>
 
+      <div class="block review-box">
+        <label class="review-toggle">
+          <input id="reviewEnabled" type="checkbox" />
+          <span>启用单边失效复核</span>
+        </label>
+        <div id="reviewOptions" hidden>
+          <label class="field">
+            <span>整数可信改正阈值（毫米，≥0）：仅 |改正| ≤ 阈值的观测可作复核边</span>
+            <input id="reviewThreshold" type="text" inputmode="numeric" value="3" />
+          </label>
+          <p class="hint">
+            启用后服务端联合选择整数高程，使复核边连接全部测站，且删去任意一条复核边后各站仍能到达基准站；
+            沿原三级裁决（最大改正量 → 改正总和 → 高程序列）取最优，而非先取原最优再检查桥边。
+          </p>
+        </div>
+      </div>
+
       <div class="block">
         <div class="block-head">
           <h3>测站（5–10 个，名称唯一；第一个为基准站）</h3>
@@ -65,6 +82,18 @@
         <div class="obj-line">
           <div><span class="obj-label">最大绝对改正量</span><strong id="objM"></strong><span class="unit">mm</span></div>
           <div><span class="obj-label">绝对改正量总和</span><strong id="objS"></strong><span class="unit">mm</span></div>
+          <div id="reviewSummary" hidden><span class="obj-label">复核</span><strong id="reviewSummaryText"></strong></div>
+        </div>
+
+        <div id="reviewWitnessBlock" class="block" hidden>
+          <div class="block-head">
+            <h3>单边失效见证：每个非基准站两条无公共观测的基准路径</h3>
+            <span class="hint">任一条复核边失效，两路径中至少仍有一条完整；路径改正可由下表改正值独立核对阈值</span>
+          </div>
+          <table class="data">
+            <thead><tr><th>测站</th><th>见证路径 1</th><th>见证路径 2</th></tr></thead>
+            <tbody id="witnessResult"></tbody>
+          </table>
         </div>
 
         <div class="block">
@@ -78,7 +107,7 @@
         <div class="block">
           <h3>逐观测改正与回算高差</h3>
           <table class="data">
-            <thead><tr><th>方向</th><th>实测 (mm)</th><th>改正 (mm)</th><th>回算高差 (mm)</th><th>允许 (mm)</th></tr></thead>
+            <thead><tr><th>方向</th><th>实测 (mm)</th><th>改正 (mm)</th><th>回算高差 (mm)</th><th>允许 (mm)</th><th id="reviewColHead" hidden>复核网</th></tr></thead>
             <tbody id="obsResult"></tbody>
           </table>
         </div>

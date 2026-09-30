@@ -27,6 +27,8 @@ let draft = clone(EXAMPLE);
 let stale = false;        // 草稿在最近一次提交后被改过
 let renderedOnce = false; // 是否曾经展示过配平结果
 let submitting = false;
+let reviewEnabled = false;
+let reviewThreshold = '3';
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -181,6 +183,11 @@ function validateDraft() {
   if (!INT_RE.test($('#datum').value.trim())) {
     errors.push('基准高程必须是整数（毫米）。');
   }
+  if (reviewEnabled) {
+    const t = $('#reviewThreshold').value.trim();
+    if (!INT_RE.test(t)) errors.push('可信改正阈值必须是整数（毫米）。');
+    else if (BigInt(t) < 0n) errors.push('可信改正阈值不能为负。');
+  }
   if (draft.stations.length < 5 || draft.stations.length > 10) {
     errors.push(`测站数量须在 5 至 10 个之间（当前 ${draft.stations.length}）。`);
   }
@@ -228,6 +235,9 @@ async function submit() {
       maxCorrection: o.cap,
     })),
   };
+  if (reviewEnabled) {
+    payload.review = { enabled: true, trustedThreshold: reviewThreshold };
+  }
 
   try {
     const resp = await fetch('./api/leveling/adjust', {
@@ -242,15 +252,17 @@ async function submit() {
       return;
     }
     if (data.feasible === false) {
-      // 无可行配平：保留草稿、清除旧结果、明确指出允许改正量不足
+      // 无可行配平/复核冗余不足：保留草稿、清除旧结果、明确报告原因
       renderedOnce = true;
       stale = false;
       $('#staleBanner').hidden = true;
       $('#result').hidden = true;
       $('#emptyBanner').hidden = true;
-      showError(data.message || '允许改正量不足，无法闭合。', [
-        '草稿已保留，可放宽若干观测的最大允许改正量后重新提交。',
-      ]);
+      const isReview = data.reason === 'REVIEW_REDUNDANCY_INSUFFICIENT';
+      const tips = isReview
+        ? ['草稿已保留、旧结论已清除。', '可加大可信改正阈值、放宽最大允许改正量，或补充环线/往返观测后重新提交。']
+        : ['草稿已保留，可放宽若干观测的最大允许改正量后重新提交。'];
+      showError(data.message || '允许改正量不足，无法闭合。', tips);
       return;
     }
     renderedOnce = true;
@@ -294,6 +306,15 @@ function renderResult(data, payload) {
   $('#objM').textContent = data.objective.maxAbsoluteCorrection;
   $('#objS').textContent = data.objective.sumAbsoluteCorrections;
 
+  const review = data.review && data.review.enabled ? data.review : null;
+  $('#reviewSummary').hidden = !review;
+  $('#reviewWitnessBlock').hidden = !review;
+  $('#reviewColHead').hidden = !review;
+  if (review) {
+    $('#reviewSummaryText').textContent =
+      `阈值 ${review.trustedThreshold} mm · ${review.reviewEdgeCount}/${data.corrections.length} 条入复核网`;
+  }
+
   // 各站高程
   const datum = b(payload.datumElevation);
   const stBody = $('#stationResult');
@@ -309,7 +330,7 @@ function renderResult(data, payload) {
   // 逐观测
   const obsBody = $('#obsResult');
   obsBody.innerHTML = '';
-  data.corrections.forEach((c) => {
+  data.corrections.forEach((c, k) => {
     const tr = el('tr');
     const corr = b(c.correction);
     tr.append(
@@ -319,11 +340,56 @@ function renderResult(data, payload) {
       el('td', '', c.recomputedDifference),
       el('td', '', `±${c.maxCorrection}`),
     );
+    if (review) {
+      const inNet = review.reviewEdges[k] === true;
+      const cell = el('td', inNet ? 'review-in' : 'review-out', inNet ? '复核边' : '—');
+      tr.append(cell);
+    }
     obsBody.append(tr);
   });
 
+  if (review) renderWitnesses(review, data);
+
   // 环路（由返回高程自然闭合）
   renderLoops(payload, data);
+}
+
+// ---------- 单边失效见证路径 ----------
+function renderWitnesses(review, data) {
+  const body = $('#witnessResult');
+  body.innerHTML = '';
+  const T = b(review.trustedThreshold);
+  const obs = data.corrections;
+  for (const w of review.witnesses) {
+    const tr = el('tr');
+    tr.append(el('td', 'dir', w.station));
+    w.paths.forEach((p) => {
+      // 独立核对：路径上每条边改正 |c| ≤ T，且路径用改正值即可复核
+      let maxC = 0n;
+      const chain = el('div', 'witness-chain');
+      for (let i = 0; i < p.stations.length; i++) {
+        chain.append(el('span', 'witness-station', p.stations[i]));
+        if (i >= p.observations.length) continue;
+        const idx = p.observations[i];
+        const c = obs[idx];
+        const corr = b(c.correction);
+        const av = corr < 0n ? -corr : corr;
+        maxC = av > maxC ? av : maxC;
+        // 按实际行进方向标注观测（观测为反向记录时调换端点展示）
+        const reverse = p.stations[i] === c.to && p.stations[i + 1] === c.from;
+        const dir = reverse ? `${c.to}→${c.from}` : `${c.from}→${c.to}`;
+        chain.append(el('span', 'witness-edge',
+          ` —${dir}(${corr > 0n ? '+' : ''}${c.correction})→ `));
+      }
+      const ok = maxC <= T;
+      const td = el('td', 'dir');
+      td.append(chain);
+      td.append(el('div', ok ? 'witness-ok' : 'witness-bad',
+        `${ok ? '✓' : '✗'} 路径最大 |改正| = ${maxC} mm（阈值 ${T} mm）`));
+      tr.append(td);
+    });
+    body.append(tr);
+  }
 }
 
 // ---------- 基础环（生成树弦环） ----------
@@ -469,9 +535,27 @@ function bind() {
     renderAll();
   });
   $('#submit').addEventListener('click', submit);
+  $('#reviewEnabled').addEventListener('change', () => {
+    reviewEnabled = $('#reviewEnabled').checked;
+    $('#reviewOptions').hidden = !reviewEnabled;
+    invalidate();
+  });
+  $('#reviewThreshold').addEventListener('input', () => {
+    reviewThreshold = $('#reviewThreshold').value.trim();
+    const bad = reviewThreshold !== ''
+      && (!INT_RE.test(reviewThreshold) || BigInt(reviewThreshold) < 0n);
+    $('#reviewThreshold').classList.toggle('invalid', bad);
+    invalidate();
+  });
   $('#reset').addEventListener('click', () => {
     draft = clone(EXAMPLE);
     $('#datum').value = draft.datum;
+    reviewEnabled = false;
+    reviewThreshold = '3';
+    $('#reviewEnabled').checked = false;
+    $('#reviewOptions').hidden = true;
+    $('#reviewThreshold').value = '3';
+    $('#reviewThreshold').classList.remove('invalid');
     invalidate();
     renderAll();
   });

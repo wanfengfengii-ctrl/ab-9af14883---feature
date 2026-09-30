@@ -9,6 +9,13 @@
 //   2. S = Σ_k |c_k|
 //   3. (H[1], H[2], …, H[n-1]) 按录入顺序的字典序
 //
+// 可选「单边失效复核」（input.review.enabled）：额外给定整数可信改正阈值
+// T >= 0，要求解出的高程中，满足 |c_k| <= T 的观测里存在一个连通全部测站、
+// 且删去任意一条仍连通基准站的复核网（无桥/2-边连通）。复核约束与三级裁决
+// 联合求解（见 review.js），不是先取原最优解再事后检查。
+
+import { solveWithReview } from './review.js';
+//
 // 算法：
 //   * 令 x_0=0、x_i=H[i]-datum（i>0），c_k = x_v-x_u-w_k。
 //     |c_k|<=b_k 是一组成对的差分约束，用 Floyd-Warshall 判负环做可行性判定，
@@ -84,6 +91,21 @@ export function validateInput(input) {
 
   const datum = toBigInt(input.datumElevation, 'datumElevation', errors);
 
+  // 可选：单边失效复核 { enabled: true, trustedThreshold: "整数毫米" }
+  let review = null;
+  if (input.review !== undefined && input.review !== null) {
+    const rv = input.review;
+    if (typeof rv !== 'object' || Array.isArray(rv)) {
+      errors.push({ field: 'review', message: 'review 必须是对象' });
+    } else if (typeof rv.enabled !== 'boolean') {
+      errors.push({ field: 'review.enabled', message: '必须是布尔值' });
+    } else if (rv.enabled) {
+      const threshold = toBigInt(rv.trustedThreshold, 'review.trustedThreshold', errors, { nonNeg: true });
+      if (threshold !== null) review = { enabled: true, threshold };
+    }
+    // enabled 为 false 或缺省：等同于未启用，保持原请求/裁决/结果不变
+  }
+
   if (!Array.isArray(input.observations)) {
     throw new ValidationError('observations 必须是数组');
   }
@@ -139,7 +161,7 @@ export function validateInput(input) {
     );
   }
 
-  return { stations, datum: datum ?? 0n, observations };
+  return { stations, datum: datum ?? 0n, observations, review };
 }
 
 // ---- 精确分数 ------------------------------------------------------------
@@ -203,7 +225,7 @@ function floyd(n, edges) {
   return dist;
 }
 
-function diffDistances(n, problem, boundFor) {
+export function diffDistances(n, problem, boundFor) {
   const edges = [];
   problem.observations.forEach((o, k) => {
     const w = shiftedObservation(o);
@@ -214,7 +236,7 @@ function diffDistances(n, problem, boundFor) {
   return floyd(n, edges);
 }
 
-const distFeasible = (dist) => dist.every((row, i) => row[i] >= 0n);
+export const distFeasible = (dist) => dist.every((row, i) => row[i] >= 0n);
 
 // ---- 两阶段单纯形（全部变量非负，BigInt 精确分数） ----------------------
 //
@@ -410,43 +432,33 @@ function lpSolveInteger(baseRows, costs) {
   return incumbent.values;
 }
 
-// ---- 主流程 --------------------------------------------------------------
+// ---- 给定每边有效上界 b_k 后的联合优化（M → S → 高程序列） ----------------
+//
+// 复用三级裁决：先对整体上界二分最小 M（b_k=min(M,b_k)），再用单纯形最小化
+// S 与高程序列字典序。返回原始 BigInt 结果与实际紧上界，供普通配平与复核复用。
 
-export function solveNetwork(input) {
-  const problem = validateInput(input);
+// 给定每边有效上界 b_k 后的联合优化（M → S → 高程序列），供普通配平与
+// 单边失效复核（review.js）复用。
+export function optimizeWithBounds(problem, bound0) {
   const { stations, datum, observations } = problem;
   const n = stations.length;
   const m = observations.length;
   const nf = n - 1;
   const t0 = nf;
+  const maxBound = bound0.reduce((a, b) => (b > a ? b : a), 0n);
 
-  const maxCap = observations.reduce((a, o) => (o.maxCorrection > a ? o.maxCorrection : a), 0n);
+  // 可行性（理论上调用方已保证；仍返回 null 兜底）
+  if (!distFeasible(diffDistances(n, problem, (_o, k) => bound0[k]))) return null;
 
-  // 阶段 1：硬界下总体可行？
-  const dist0 = diffDistances(n, problem, (o) => o.maxCorrection);
-  if (!distFeasible(dist0)) {
-    return {
-      feasible: false,
-      reason: 'INSUFFICIENT_CORRECTION',
-      message: '允许改正量不足：在各观测给定的最大允许改正量内，不存在能使全部环路闭合的整数高程解。请放宽若干观测的最大允许改正量，或核对实测高差。',
-      stations: stations.map((name, i) => ({ name, elevation: i === 0 ? datum.toString() : null })),
-      observations: observations.map((o) => ({
-        from: o.from, to: o.to,
-        measuredDifference: o.measuredDifference.toString(),
-        maxCorrection: o.maxCorrection.toString(),
-      })),
-    };
-  }
-
-  // 阶段 2：二分最小 M
-  let lo = 0n, hi = maxCap;
+  // 二分最小 M
+  let lo = 0n, hi = maxBound;
   while (lo < hi) {
     const mid = (lo + hi) / 2n;
-    const d = diffDistances(n, problem, (o) => (mid < o.maxCorrection ? mid : o.maxCorrection));
+    const d = diffDistances(n, problem, (_o, k) => (mid < bound0[k] ? mid : bound0[k]));
     if (distFeasible(d)) hi = mid; else lo = mid + 1n;
   }
   const M = lo;
-  const B = observations.map((o) => (M < o.maxCorrection ? M : o.maxCorrection));
+  const B = bound0.map((b) => (M < b ? M : b));
 
   // 各 x_i 在 M* 下的紧可行整数区间
   const dist = diffDistances(n, problem, (_o, k) => B[k]);
@@ -518,8 +530,71 @@ export function solveNetwork(input) {
   for (let i = 0; i < nf; i++) xs.push(lows[i] + values[i]);
   const elevations = xs.map((x) => datum + x);
 
-  const corrections = observations.map((o) => {
-    const c = elevations[o.toIndex] - elevations[o.fromIndex] - o.measuredDifference;
+  const corrBig = observations.map((o) =>
+    elevations[o.toIndex] - elevations[o.fromIndex] - o.measuredDifference);
+  let gotM = 0n, gotS = 0n;
+  for (const c of corrBig) { const a = c < 0n ? -c : c; if (a > gotM) gotM = a; gotS += a; }
+  if (gotM !== M) throw new Error('内部错误：解未达到最优最大改正量');
+  corrBig.forEach((c, k) => {
+    const a = c < 0n ? -c : c;
+    if (a > B[k]) throw new Error('内部错误：改正量越限');
+  });
+
+  return { elevations, corrections: corrBig, M, S: gotS, bounds: B };
+}
+
+// ---- 主流程 --------------------------------------------------------------
+
+export function solveNetwork(input) {
+  const problem = validateInput(input);
+  const { stations, datum, observations, review } = problem;
+  const n = stations.length;
+
+  // 阶段 1：硬界下总体可行？
+  const dist0 = diffDistances(n, problem, (o) => o.maxCorrection);
+  if (!distFeasible(dist0)) {
+    return infeasiblePayload(problem, review
+      ? { enabled: true, trustedThreshold: review.threshold.toString(), sufficient: false }
+      : null);
+  }
+
+  // 未启用单边失效复核：原三级裁决与结果结构保持不变
+  if (!review) {
+    const r = optimizeWithBounds(problem, observations.map((o) => o.maxCorrection));
+    if (!r) return infeasiblePayload(problem, null);
+    return formatSolution(problem, r, null);
+  }
+
+  // 启用单边失效复核：复核约束与三级裁决联合求解（见 review.js）
+  const reviewOutcome = solveWithReview(problem);
+  if (reviewOutcome.feasible === false) return reviewOutcome;
+  return formatSolution(problem, reviewOutcome.result, reviewOutcome.reviewBlock);
+}
+
+// 不可行（允许改正量不足 / 复核冗余不足）时的统一回包：保留草稿与基准高程，
+// 不带任何配平结论。
+function infeasiblePayload(problem, reviewBlock) {
+  const { stations, datum, observations, review } = problem;
+  const payload = {
+    feasible: false,
+    reason: 'INSUFFICIENT_CORRECTION',
+    message: '允许改正量不足：在各观测给定的最大允许改正量内，不存在能使全部环路闭合的整数高程解。请放宽若干观测的最大允许改正量，或核对实测高差。',
+    stations: stations.map((name, i) => ({ name, elevation: i === 0 ? datum.toString() : null })),
+    observations: observations.map((o) => ({
+      from: o.from, to: o.to,
+      measuredDifference: o.measuredDifference.toString(),
+      maxCorrection: o.maxCorrection.toString(),
+    })),
+  };
+  if (review) payload.review = reviewBlock;
+  return payload;
+}
+
+// 把原始 BigInt 结果格式化为 API 输出；reviewBlock 为 null 时结构与旧版完全一致。
+function formatSolution(problem, r, reviewBlock) {
+  const { stations, observations } = problem;
+  const corrections = observations.map((o, k) => {
+    const c = r.corrections[k];
     return {
       from: o.from,
       to: o.to,
@@ -529,28 +604,16 @@ export function solveNetwork(input) {
       recomputedDifference: (o.measuredDifference + c).toString(),
     };
   });
-
-  const gotM = corrections.reduce((a, x) => {
-    const v = BigInt(x.correction); const av = v < 0n ? -v : v;
-    return av > a ? av : a;
-  }, 0n);
-  const gotS = corrections.reduce((a, x) => {
-    const v = BigInt(x.correction);
-    return a + (v < 0n ? -v : v);
-  }, 0n);
-  if (gotM !== M) throw new Error('内部错误：解未达到最优最大改正量');
-  for (const x of corrections) {
-    const v = BigInt(x.correction); const av = v < 0n ? -v : v;
-    if (av > BigInt(x.maxCorrection)) throw new Error('内部错误：改正量越限');
-  }
-
-  return {
+  const out = {
     feasible: true,
-    stations: stations.map((name, i) => ({ name, elevation: elevations[i].toString() })),
+    stations: stations.map((name, i) => ({ name, elevation: r.elevations[i].toString() })),
     corrections,
     objective: {
-      maxAbsoluteCorrection: M.toString(),
-      sumAbsoluteCorrections: gotS.toString(),
+      maxAbsoluteCorrection: r.M.toString(),
+      sumAbsoluteCorrections: r.S.toString(),
     },
   };
+  if (reviewBlock) out.review = reviewBlock;
+  return out;
 }
+

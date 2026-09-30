@@ -116,6 +116,27 @@ input.invalid { border-color: var(--error); background: var(--error-bg); }
 .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
 .hint { color: var(--muted); font-size: 12px; }
 
+.review-box {
+  border: 1px dashed #93c5fd;
+  background: #f8fbff;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.review-toggle { display: flex; gap: 8px; align-items: center; font-weight: 600; cursor: pointer; }
+.review-toggle input { width: auto; }
+.review-box .hint { margin: 8px 0 0; line-height: 1.6; }
+.review-box .field { margin-top: 8px; max-width: 320px; }
+
+.data td.review-in { color: var(--ok); font-weight: 600; font-family: inherit; }
+.data td.review-out { color: var(--muted); font-family: inherit; }
+
+.witness-chain { font-family: var(--mono); font-size: 12px; line-height: 1.7; }
+.witness-station { font-weight: 600; }
+.witness-edge { color: var(--muted); }
+.witness-ok { color: var(--ok); font-size: 11px; margin-top: 2px; font-family: inherit; }
+.witness-bad { color: var(--error); font-size: 11px; margin-top: 2px; font-family: inherit; }
+#witnessResult td { vertical-align: top; text-align: left; }
+
 .banner { padding: 10px 12px; border-radius: 7px; font-size: 13px; margin-bottom: 12px; border: 1px solid transparent; }
 .banner-warn { background: var(--warn-bg); color: var(--warn); border-color: #fcd34d; }
 .banner-error { background: var(--error-bg); color: var(--error); border-color: #fca5a5; white-space: pre-wrap; }

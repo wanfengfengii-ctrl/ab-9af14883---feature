@@ -114,3 +114,62 @@ test('未知路由返回 404', async () => {
   const r = await fetch(`${base}/nope`);
   assert.equal(r.status, 404);
 });
+
+test('启用单边失效复核：返回 review 块、逐观测标记与两条见证路径', async () => {
+  const r = await fetch(`${base}/api/leveling/adjust`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stations: ['A', 'B', 'C', 'D', 'E'],
+      datumElevation: '1000',
+      observations: [
+        { from: 'A', to: 'B', measuredDifference: '12', maxCorrection: '5' },
+        { from: 'B', to: 'C', measuredDifference: '15', maxCorrection: '5' },
+        { from: 'C', to: 'D', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'D', to: 'A', measuredDifference: '-15', maxCorrection: '5' },
+        { from: 'A', to: 'E', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'E', to: 'D', measuredDifference: '25', maxCorrection: '5' },
+        { from: 'B', to: 'E', measuredDifference: '-20', maxCorrection: '5' },
+      ],
+      review: { enabled: true, trustedThreshold: '1' },
+    }),
+  });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.feasible, true);
+  assert.equal(j.review.enabled, true);
+  assert.equal(j.review.sufficient, true);
+  assert.equal(j.review.trustedThreshold, '1');
+  assert.equal(j.review.reviewEdges.length, 7);
+  assert.equal(j.review.witnesses.length, 4);
+  for (const w of j.review.witnesses) {
+    assert.equal(w.paths.length, 2);
+    const common = w.paths[0].observations.filter((k) => w.paths[1].observations.includes(k));
+    assert.deepEqual(common, []);
+  }
+});
+
+test('启用复核但阈值为负：400 字段级校验错误', async () => {
+  const r = await fetch(`${base}/api/leveling/adjust`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      stations: ['A', 'B', 'C', 'D', 'E'],
+      datumElevation: '1000',
+      observations: [
+        { from: 'A', to: 'B', measuredDifference: '12', maxCorrection: '5' },
+        { from: 'B', to: 'C', measuredDifference: '15', maxCorrection: '5' },
+        { from: 'C', to: 'D', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'D', to: 'A', measuredDifference: '-15', maxCorrection: '5' },
+        { from: 'A', to: 'E', measuredDifference: '-10', maxCorrection: '5' },
+        { from: 'E', to: 'D', measuredDifference: '25', maxCorrection: '5' },
+        { from: 'B', to: 'E', measuredDifference: '-20', maxCorrection: '5' },
+      ],
+      review: { enabled: true, trustedThreshold: '-1' },
+    }),
+  });
+  assert.equal(r.status, 400);
+  const j = await r.json();
+  assert.equal(j.error.code, 'VALIDATION_FAILED');
+  assert.ok(j.error.details.some((d) => d.field === 'review.trustedThreshold'));
+});

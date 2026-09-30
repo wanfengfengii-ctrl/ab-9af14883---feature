@@ -15,6 +15,31 @@ c_k = H[终点] − H[起点] − 实测高差_k
 
 所有高程、高差、改正量均为整数毫米。
 
+## 单边失效复核（可选）
+
+在请求中携带 `review: { "enabled": true, "trustedThreshold": "T" }`（T 为非负整数毫米）
+即可启用。未启用或 `enabled:false` 时，**请求、三级裁决与结果结构与原来完全一致**。
+
+启用后：
+
+- 只有绝对改正量 `|c_k| ≤ T` 的观测才能作为**复核边**；
+- 服务端**联合**选择整数高程，使复核边连接全部测站，且**删去其中任意一条后每个测站
+  仍能沿其余复核边到达基准站**（复核网无桥/2-边连通，等价于每个非基准站都有两条不含
+  公共观测的基准路径）；
+- 在所有满足复核条件的高程中，沿用既有三级裁决（最大改正量 M → 改正总和 S → 按录入
+  顺序的高程序列字典序）取最优。求解是**联合**的：按「能被压进阈值的观测」枚举无桥
+  复核核并在收紧约束下整体重裁，而**不是**先取原最优配平、再回头检查桥边；
+- 成功时返回：
+  - 每条观测的 `review.reviewEdges[k]`（是否进入复核网，可由返回改正值独立核对
+    `|correction| ≤ T`）；
+  - `review.witnesses`：每个非基准站**两条无公共观测**的基准路径（站名序列 + 观测
+    下标），路径上每条边都满足 `|c| ≤ T`；任一复核边失效，两路径中至少仍有一条完整；
+  - `review.core`：复核网中的一张极小无桥核（诊断用）；
+- 若原网络在给定允许改正量内本就无法配平，仍返回 `INSUFFICIENT_CORRECTION`；
+- 若原网络可配平、但不存在满足复核条件的整数高程（包括整张观测网本身就含桥），
+  HTTP 200 返回 `feasible:false, reason:"REVIEW_REDUNDANCY_INSUFFICIENT"`，
+  **保留草稿、清除旧结论并明确报告「复核冗余不足」**。
+
 ## 目录结构
 
 ```
@@ -87,7 +112,8 @@ npm --prefix web run dev                     # 另一终端启动开发服务器
   "datumElevation": "1000",
   "observations": [
     { "from": "A", "to": "B", "measuredDifference": "12", "maxCorrection": "5" }
-  ]
+  ],
+  "review": { "enabled": true, "trustedThreshold": "3" }
 }
 ```
 
@@ -105,8 +131,32 @@ npm --prefix web run dev                     # 另一终端启动开发服务器
     "measuredDifference": "12", "maxCorrection": "5",
     "correction": "-1", "recomputedDifference": "11"
   }],
-  "objective": { "maxAbsoluteCorrection": "1", "sumAbsoluteCorrections": "3" }
+  "objective": { "maxAbsoluteCorrection": "1", "sumAbsoluteCorrections": "3" },
+  "review": {
+    "enabled": true,
+    "trustedThreshold": "3",
+    "sufficient": true,
+    "reviewEdges": [true, true, false],
+    "reviewEdgeCount": 2,
+    "core": [0, 1, 3],
+    "witnesses": [
+      { "station": "B", "paths": [
+        { "stations": ["B", "A"], "observations": [0] },
+        { "stations": ["B", "C", "A"], "observations": [1, 3] }
+      ] }
+    ]
+  }
 }
+```
+
+仅在启用复核且成功时才出现 `review` 字段；其中 `witnesses` 覆盖每个非基准站，
+两条 `paths` 的 `observations` 互不相交，且只引用 `reviewEdges[k]=true` 的观测。
+
+复核冗余不足（原网可配平但无满足条件的高程）：HTTP 200，
+
+```json
+{ "feasible": false, "reason": "REVIEW_REDUNDANCY_INSUFFICIENT", "message": "复核冗余不足：…",
+  "review": { "enabled": true, "trustedThreshold": "3", "sufficient": false } }
 ```
 
 成功（但**允许改正量不足**，无可行配平）：HTTP 200，
@@ -131,6 +181,12 @@ npm --prefix web run dev                     # 另一终端启动开发服务器
 
 随机测试对数百个小型网络与全枚举暴力最优解逐字段对比（M、S、完整高程序列），
 另含往返平行观测、负基准、可行/不可行判定与 HTTP 层测试。
+
+单边失效复核在上述求解前加一层**联合**的无桥核枚举：把 `cap_k ≤ T` 的观测视为恒紧，
+其余观测枚举使其并集无桥连通的极小核，对每个核在「核上边上界取 T、其余取 cap」的
+约束下复用上面的 M→S→字典序优化器，再按同一裁决取全局最优；最后用无向单位容量最大流
+为每个非基准站求出两条边不相交的基准路径。另有与暴力枚举逐字段对比的随机测试
+（含「原最优解不合格、联合解合格」与复核冗余不足样本）。
 
 ## 前端行为
 
