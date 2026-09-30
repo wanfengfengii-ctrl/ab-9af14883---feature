@@ -1,0 +1,59 @@
+# 洞穴水准网配平：前端 + API + 一次性 verify
+#
+# 可配置端口（宿主机侧）：复制 .env.example 为 .env 后修改 WEB_PORT / API_PORT。
+services:
+  api:
+    build:
+      context: ./api
+    image: leveling-api:latest
+    environment:
+      # 容器内固定监听 8081；宿主机端口由 API_PORT 决定
+      API_PORT: "8081"
+      API_HOST: "0.0.0.0"
+    ports:
+      - "${API_PORT:-8081}:8081"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: leveling-web:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  # 一次性服务：等待两个服务健康后，执行代码测试、前端构建、闭合网 API 冒烟，
+  # 汇总结果并退出（非 0 退出码表示存在失败步骤）。
+  # 不随 `docker compose up` 启动；显式触发：
+  #   docker compose run --build --rm verify
+  verify:
+    profiles: ["verify"]
+    build:
+      context: .
+      dockerfile: verify/Dockerfile
+    image: leveling-verify:latest
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    environment:
+      API_URL: "http://api:8081"
+      WEB_URL: "http://web:8080"
+    restart: "no"

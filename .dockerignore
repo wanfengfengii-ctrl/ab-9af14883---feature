@@ -1,0 +1,9 @@
+.git
+.gitignore
+node_modules
+.npm-cache
+web/node_modules
+web/dist
+api/node_modules
+*.log
+.env

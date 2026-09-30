@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>洞穴水准网联合配平</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>洞穴水准网联合配平</h1>
+    <p class="subtitle">往返水准观测 · 整数毫米 · 联合选择全部高程（最小最大改正量 → 最小总和 → 录入顺序字典序）</p>
+  </header>
+
+  <main class="layout">
+    <!-- 左：录入草稿 -->
+    <section class="card" aria-labelledby="draft-title">
+      <h2 id="draft-title">观测草稿</h2>
+
+      <div class="row">
+        <label class="field">
+          <span>基准高程（毫米，整数）</span>
+          <input id="datum" type="text" inputmode="numeric" value="1000" />
+        </label>
+        <button id="addStation" class="btn btn-ghost" type="button">＋ 测站</button>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h3>测站（5–10 个，名称唯一；第一个为基准站）</h3>
+          <span id="stationCount" class="badge"></span>
+        </div>
+        <div id="stationList" class="station-list"></div>
+      </div>
+
+      <div class="block">
+        <div class="block-head">
+          <h3>有向观测（7–18 条）</h3>
+          <span id="obsCount" class="badge"></span>
+        </div>
+        <div class="obs-head obs-grid">
+          <span>起点</span><span>终点</span>
+          <span>实测高差<br />(mm)</span><span>最大允许改正<br />(mm)</span><span></span>
+        </div>
+        <div id="obsList"></div>
+        <button id="addObs" class="btn btn-ghost" type="button">＋ 观测</button>
+      </div>
+
+      <div class="actions">
+        <button id="submit" class="btn btn-primary" type="button">提交配平</button>
+        <button id="reset" class="btn btn-ghost" type="button">恢复示例</button>
+        <span id="draftHint" class="hint"></span>
+      </div>
+    </section>
+
+    <!-- 右：结论 -->
+    <section class="card" aria-labelledby="result-title">
+      <h2 id="result-title">配平结果</h2>
+
+      <div id="staleBanner" class="banner banner-warn" hidden>草稿已修改，旧结论已撤销；重新提交以获得新结果。</div>
+      <div id="errorBanner" class="banner banner-error" hidden></div>
+      <div id="emptyBanner" class="banner banner-muted">尚未提交。录入或核对草稿后点击「提交配平」。</div>
+
+      <div id="result" hidden>
+        <div class="obj-line">
+          <div><span class="obj-label">最大绝对改正量</span><strong id="objM"></strong><span class="unit">mm</span></div>
+          <div><span class="obj-label">绝对改正量总和</span><strong id="objS"></strong><span class="unit">mm</span></div>
+        </div>
+
+        <div class="block">
+          <h3>各站高程</h3>
+          <table class="data">
+            <thead><tr><th>#</th><th>测站</th><th>高程（mm）</th><th>相对基准（mm）</th></tr></thead>
+            <tbody id="stationResult"></tbody>
+          </table>
+        </div>
+
+        <div class="block">
+          <h3>逐观测改正与回算高差</h3>
+          <table class="data">
+            <thead><tr><th>方向</th><th>实测 (mm)</th><th>改正 (mm)</th><th>回算高差 (mm)</th><th>允许 (mm)</th></tr></thead>
+            <tbody id="obsResult"></tbody>
+          </table>
+        </div>
+
+        <div class="block">
+          <div class="block-head">
+            <h3>环路闭合（由返回高程自然闭合）</h3>
+            <span class="hint">基础环生成树环；闭合差＝沿环实测高差代数和，闭合值＝改正后代数和</span>
+          </div>
+          <table class="data">
+            <thead><tr><th>环路</th><th>观测闭合差 (mm)</th><th>改正后闭合 (mm)</th></tr></thead>
+            <tbody id="loopResult"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>POST <code>/api/leveling/adjust</code></span>
+    <span id="apiState"></span>
+  </footer>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "leveling-network",
+  "private": true,
+  "version": "1.0.0",
+  "description": "洞穴往返水准观测高程网联合配平（整数最小最大/最小总和/字典序）",
+  "scripts": {
+    "test": "npm --prefix api test",
+    "build": "npm --prefix web run build"
+  },
+  "workspaces": [
+    "api",
+    "web"
+  ]
+}
